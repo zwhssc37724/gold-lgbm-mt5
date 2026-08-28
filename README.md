@@ -42,7 +42,7 @@ uv run gold-train --target direction                           # 涨跌方向（
 | 工具 | 说明 |
 |---|---|
 | `get_quote(symbol)` | MT5 实时报价（bid/ask/last） |
-| `get_klines(symbol, timeframe, bars)` | OHLCV K线，M1..D1 |
+| `get_klines(symbol, timeframe, bars)` | OHLCV K线，M1、M15、M30、H1、H4、D1、W1 |
 | `predict(symbol, timeframe)` | LightGBM 预测（概率 + 信号 + 报价） |
 
 连接示例（任何 MCP 客户端，如 Claude Desktop / Cursor）：
