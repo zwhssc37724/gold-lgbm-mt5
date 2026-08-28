@@ -1,0 +1,39 @@
+2026-08-28 20:23:57,171 INFO klines loaded: 23328 rows (source includes fallback)
+2026-08-28 20:23:58,155 INFO dataset ready: target=direction3, 23105 samples, 42 features, 三类分布={0: 0.3358, 1: 0.2452, 2: 0.419}
+2026-08-28 20:23:58,155 INFO train=18484  test=4621 (time-ordered split)
+2026-08-28 20:26:40,485 INFO best CV 多分类对数损失=1.06121  params={'num_leaves': 31, 'max_depth': 9, 'learning_rate': 0.01749967774554321, 'min_child_samples': 484, 'feature_fraction': 0.8227033106403476, 'bagging_fraction': 0.5056593979796737, 'bagging_freq': 3, 'lambda_l1': 1.4329321655479917e-08, 'lambda_l2': 0.009319752738885665, 'objective': 'multiclass', 'metric': 'multi_logloss', 'verbosity': -1, 'seed': 42, 'num_class': 3}
+2026-08-28 20:26:41,225 INFO test metrics: {'测试样本数': 4621, '测试准确率': 0.43864964293442976, '测试宏平均AUC（OvR）': 0.5625962496201272, '测试集三类分布': {0: 0.3716, 1: 0.1956, 2: 0.4328}}
+2026-08-28 20:26:41,237 INFO   特征 vol_168          增益=8963.9
+2026-08-28 20:26:41,237 INFO   特征 atr_14           增益=4555.0
+2026-08-28 20:26:41,237 INFO   特征 mom_168          增益=3371.1
+2026-08-28 20:26:41,237 INFO   特征 vol_24           增益=2705.5
+2026-08-28 20:26:41,237 INFO   特征 vol_72           增益=2526.3
+2026-08-28 20:26:41,238 INFO   特征 ma_bias_200      增益=2452.9
+2026-08-28 20:26:41,238 INFO   特征 skew_24          增益=1639.0
+2026-08-28 20:26:41,238 INFO   特征 dow_sin          增益=1344.9
+2026-08-28 20:26:41,238 INFO   特征 kurt_24          增益=1096.2
+2026-08-28 20:26:41,238 INFO   特征 macd_signal      增益=795.6
+2026-08-28 20:26:41,238 INFO   特征 autocorr_24      增益=714.0
+2026-08-28 20:26:41,238 INFO   特征 atr_7            增益=664.4
+2026-08-28 20:26:41,238 INFO   特征 ema_cross        增益=639.7
+2026-08-28 20:26:41,238 INFO   特征 mom_72           增益=503.4
+2026-08-28 20:26:41,238 INFO   特征 ret_48           增益=428.0
+{
+  "目标": "direction3",
+  "最佳CV": {
+    "multi_logloss": 1.0612087487496245
+  },
+  "测试集指标": {
+    "测试样本数": 4621,
+    "测试准确率": 0.43864964293442976,
+    "测试宏平均AUC（OvR）": 0.5625962496201272,
+    "测试集三类分布": {
+      "0": 0.3716,
+      "1": 0.1956,
+      "2": 0.4328
+    }
+  },
+  "模型路径": "E:\\Documents\\PythonProjects\\gold-lgbm-mt5\\models\\gold_lgbm_direction3.pkl"
+}
+模型已保存 -> E:\Documents\PythonProjects\gold-lgbm-mt5\models\gold_lgbm_direction3.pkl
+EXIT=0
