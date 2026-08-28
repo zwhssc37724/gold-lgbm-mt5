@@ -106,18 +106,37 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_labels(df: pd.DataFrame, horizon: int = 1, target: str = "direction") -> pd.Series:
-    """Binary labels for the trading model.
+    """二分类标签。
 
-    target="direction": next close above current close (hard, near coin-flip OOS).
-    target="breakout":  next bar's relative range exceeds the rolling 100-bar
-                        median range (volatility expansion; genuinely learnable).
+    target="breakout":  下一根 K 线的相对振幅是否突破近 N 根中位数（波动扩张）。
+    target="direction": 下一根 K 线收盘是否高于当前收盘。
     """
     close = df["close"]
     if target == "direction":
         fwd = np.log(close.shift(-horizon) / close)
         return (fwd > 0).astype(int)
     if target == "breakout":
+        from gold_model import config  # 避免循环导入
+
         rng = (df["high"] - df["low"]) / close
-        baseline = rng.rolling(100).median()
+        baseline = rng.rolling(config.BREAKOUT_LOOKBACK).median()
         return (rng.shift(-horizon) > baseline).astype(int)
     raise ValueError(f"unknown target: {target}")
+
+
+def build_labels_3class(
+    df: pd.DataFrame, horizon: int = 24, threshold: float = 0.003
+) -> pd.Series:
+    """方向三分类标签：0=看空（跌超阈值）、1=观望（在阈值内）、2=看多（涨超阈值）。"""
+    from gold_model import config  # 延迟导入
+
+    horizon = horizon or config.DIRECTION3_HORIZON
+    threshold = threshold or config.DIRECTION3_THRESHOLD
+    fwd = np.log(df["close"].shift(-horizon) / df["close"])
+    labels = pd.Series(1, index=df.index, dtype=int)  # 默认观望
+    labels[fwd > threshold] = 2  # 看多
+    labels[fwd < -threshold] = 0  # 看空
+    return labels
+
+
+DIRECTION3_NAMES_CN = {0: "看空", 1: "观望", 2: "看多"}

@@ -6,20 +6,32 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 MODEL_DIR = PROJECT_ROOT / "models"
 DATA_DIR = PROJECT_ROOT / "data"
 
-SYMBOL = "XAUUSD"
-TIMEFRAME = "H1"          # MT5 timeframe used for klines
-BARS = 50_000             # number of H1 bars to pull for training
-LABEL_HORIZON = 1         # predict direction of the next bar
+# 交易品种与周期
+SYMBOL = "XAUUSD"           # 黄金 / 美元
+TIMEFRAME = "H1"            # 1 小时 K 线
+
+# 训练样本
+BARS = 50_000               # 拉取的 H1 K 线根数（受 MT5 终端历史限制）
+
+# 突破/扩张二分类：预测下一根 K 线振幅是否超过近 100 根中位数
+BREAKOUT_HORIZON = 1
+BREAKOUT_LOOKBACK = 100
+
+# 方向三分类：未来 24 根（约 1 个交易日）收益率，按 ±0.3% 阈值划分
+DIRECTION3_HORIZON = 24
+DIRECTION3_THRESHOLD = 0.003  # 0.3%
 
 # Optuna / LightGBM
 N_TRIALS = 60
 RANDOM_STATE = 42
 EARLY_STOPPING_ROUNDS = 100
 
-# MCP server
+# MCP 服务
 MCP_HOST = "127.0.0.1"
 MCP_PORT = 8000
 MCP_PATH = "/mcp"
 
-MODEL_PATH = MODEL_DIR / "gold_lgbm.pkl"
+# 模型文件
+BREAKOUT_MODEL_PATH = MODEL_DIR / "gold_lgbm_breakout.pkl"
+DIRECTION3_MODEL_PATH = MODEL_DIR / "gold_lgbm_direction3.pkl"
 FEATURES_PATH = MODEL_DIR / "features.json"
