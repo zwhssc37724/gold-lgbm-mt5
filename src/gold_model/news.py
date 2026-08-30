@@ -294,9 +294,14 @@ def _parse_jin10_item(item: dict) -> NewsEvent:
 
 
 def fetch_jin10_calendar(date: str | None = None) -> list[NewsEvent]:
-    """抓取金十财经日历（自动选择 API 或网页抓取）。
+    """抓取财经日历（自动选择数据源）。
 
-    优先级：API > 网页抓取 > 缓存
+    优先级：金十 API（需 key）> ForexFactory 国际源 > 金十网页端点 > 缓存
+
+    2026-08-30 修复：金十 cdn-rili.jin10.com 的 CDN 在本网络环境 TLS 握手直接失败
+    （SSLEOFError，curl 同样失败），rili.jin10.com/api/calendar 返回 404 HTML。
+    新增 ForexFactory 官方 JSON 日历（nfs.faireconomy.media）作为主备用源，
+    数据完整（title/country/date/impact/forecast/previous），每周一个文件。
     """
     # 优先使用 API（如果配置了 key）
     if JIN10_API_KEY:
@@ -304,7 +309,12 @@ def fetch_jin10_calendar(date: str | None = None) -> list[NewsEvent]:
         if events:
             return events
 
-    # 备用：网页抓取
+    # 主备用：ForexFactory 国际源（本网络可达，无墙）
+    events = fetch_forexfactory_calendar(date)
+    if events:
+        return events
+
+    # 再备用：金十网页端点（网络恢复时可用）
     events = fetch_jin10_calendar_web(date)
     if events:
         return events
@@ -312,10 +322,113 @@ def fetch_jin10_calendar(date: str | None = None) -> list[NewsEvent]:
     # 最后尝试读取任何缓存
     if date is None:
         date = datetime.now(UTC).strftime("%Y-%m-%d")
-    for prefix in ("jin10_calendar_api", "jin10_calendar_web"):
+    for prefix in ("jin10_calendar_api", "jin10_calendar_web", "ff_calendar"):
         cached = _load_cache(prefix, date)
         if cached is not None:
             return [NewsEvent(**item) for item in cached]
+
+    return []
+
+
+# ForexFactory 国名 → 中文
+_FF_COUNTRY_CN = {
+    "USD": "美国", "EUR": "欧元区", "JPY": "日本", "GBP": "英国", "CNY": "中国",
+    "AUD": "澳大利亚", "CAD": "加拿大", "CHF": "瑞士", "NZD": "新西兰", "All": "全球",
+}
+_FF_IMPACT_CN = {"High": "极高", "Medium": "高", "Low": "低", "Holiday": "低", "": "低"}
+
+
+def _ff_week_file(date_str: str) -> str:
+    """ForexFactory 按"周"发布日历文件：返回 date 所在周的三个候选文件名。"""
+    d = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=UTC)
+    # 周日为一周起点（FF 惯例）
+    start = d - timedelta(days=(d.weekday() + 1) % 7)
+    files = []
+    for off in (0, -7, 7):
+        w = start + timedelta(days=off)
+        files.append(w.strftime("%Y-%m-%d"))
+    return files[0]  # 主文件；备选在调用处处理
+
+
+def fetch_forexfactory_calendar(date: str | None = None) -> list[NewsEvent]:
+    """ForexFactory 财经日历（国际源，稳定可达）。
+
+    数据源：nfs.faireconomy.media/ff_calendar_thisweek.json（官方公开 JSON）。
+    周数据按日期过滤出目标日。
+
+    限流处理：429 时指数退避重试（最多 3 次）；当日缓存 6 小时内有效
+    （FF 日历一天更新几次，比金十的 24h 短以保证及时性）。
+    """
+    if date is None:
+        date = datetime.now(UTC).strftime("%Y-%m-%d")
+
+    cached = _load_cache("ff_calendar", date)
+    if cached is not None:
+        return [NewsEvent(**item) for item in cached]
+
+    import time
+
+    try:
+        import requests
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Referer": "https://www.forexfactory.com/",
+        }
+        # 本周 + 上周（周末跨周时本周文件可能还没发布）
+        urls = [
+            "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+            "https://nfs.faireconomy.media/ff_calendar_lastweek.json",
+        ]
+        for url in urls:
+            data = None
+            # 限流重试：429 → 指数退避
+            for attempt in range(3):
+                try:
+                    resp = requests.get(url, headers=headers, timeout=20)
+                    if resp.status_code == 429 and attempt < 2:
+                        wait = 15 * (2 ** attempt)  # 15s, 30s
+                        logger.info("ForexFactory 限流，%ds 后重试", wait)
+                        time.sleep(wait)
+                        continue
+                    if resp.status_code == 200:
+                        data = resp.json()
+                    break
+                except requests.RequestException as e:
+                    logger.debug("ForexFactory 端点失败 %s: %s", url, e)
+                    break
+            if not isinstance(data, list):
+                continue
+            events = []
+            for item in data:
+                try:
+                    dt = datetime.fromisoformat(item.get("date", ""))
+                    target = datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=UTC)
+                    # FF 时区为美东；先按事件自身时区日期归属，再按 UTC 日期兜底（跨日误差可接受）
+                    if dt.date() != target.date() and dt.astimezone(UTC).date() != target.date():
+                        continue
+                except ValueError:
+                    continue
+                country = item.get("country", "")
+                events.append(NewsEvent(
+                    title=item.get("title", ""),
+                    time=item.get("date", ""),
+                    country=_FF_COUNTRY_CN.get(country, country),
+                    importance=_FF_IMPACT_CN.get(item.get("impact", ""), "低"),
+                    actual=None,
+                    forecast=item.get("forecast") or None,
+                    previous=item.get("previous") or None,
+                    source="ForexFactory",
+                    url="",
+                ))
+            if events:
+                logger.info("ForexFactory 日历获取成功: %s 共 %d 条事件", date, len(events))
+                _save_cache("ff_calendar", date, [vars(e) for e in events])
+                return events
+
+    except Exception as e:
+        logger.error("ForexFactory 日历抓取失败: %s", e)
 
     return []
 
@@ -637,314 +750,3 @@ def get_daily_briefing() -> dict:
     }
 
 
-
-@dataclass
-class NewsEvent:
-    """财经事件/数据。"""
-    title: str
-    time: str  # ISO 格式
-    country: str  # 国家/地区
-    importance: str  # 重要性：极高/高/中/低
-    actual: str | None = None  # 实际值
-    forecast: str | None = None  # 预期值
-    previous: str | None = None  # 前值
-    source: str = ""  # 数据来源
-    url: str = ""  # 链接
-
-    @property
-    def event_type(self) -> str:
-        """判断事件类型（非农/CPI/美联储等）。"""
-        for event_type, keywords in IMPORTANT_EVENTS.items():
-            if any(kw.lower() in self.title.lower() for kw in keywords):
-                return event_type
-        return "其他"
-
-
-def _get_cache_path(prefix: str, date: str) -> Path:
-    """获取缓存文件路径。"""
-    return CACHE_DIR / f"{prefix}_{date}.json"
-
-
-def _save_cache(prefix: str, date: str, data: list[dict]) -> None:
-    """保存缓存。"""
-    path = _get_cache_path(prefix, date)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-    logger.info("缓存已保存: %s (%d 条)", path, len(data))
-
-
-def _load_cache(prefix: str, date: str) -> list[dict] | None:
-    """读取缓存。"""
-    path = _get_cache_path(prefix, date)
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception as e:
-            logger.warning("缓存读取失败 %s: %s", path, e)
-    return None
-
-
-def fetch_jin10_calendar(date: str | None = None) -> list[NewsEvent]:
-    """抓取金十财经日历。
-
-    参数：
-      - date: 日期，格式 YYYY-MM-DD，默认今天
-
-    返回：NewsEvent 列表
-
-    注意：金十没有公开免费 API，此函数尝试通过网页抓取。
-    如果抓取失败，返回空列表。建议使用金十开放平台 API（需付费/申请）。
-    """
-    if date is None:
-        date = datetime.now(UTC).strftime("%Y-%m-%d")
-
-    # 尝试读取缓存
-    cached = _load_cache("jin10_calendar", date)
-    if cached is not None:
-        return [NewsEvent(**item) for item in cached]
-
-    # 网页抓取（金十日历页面是 SSR + CSR 混合，直接抓取可能拿不到数据）
-    # 这里使用一个已知的备用方案：尝试抓取金十的 API 端点
-    events = []
-
-    try:
-        import requests
-
-        # 尝试金十日历的 API 端点（这个端点可能会变）
-        url = f"https://rili.jin10.com/api/calendar?date={date}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-            "Referer": "https://rili.jin10.com/",
-        }
-
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            try:
-                data = resp.json()
-                # 解析金十的日历数据结构
-                # 注意：这个解析逻辑基于对金十 API 的观察，可能随时变化
-                if isinstance(data, dict) and "data" in data:
-                    for item in data["data"]:
-                        events.append(NewsEvent(
-                            title=item.get("title", ""),
-                            time=item.get("time", ""),
-                            country=item.get("country", ""),
-                            importance=item.get("importance", "低"),
-                            actual=item.get("actual"),
-                            forecast=item.get("forecast"),
-                            previous=item.get("previous"),
-                            source="金十数据",
-                            url=f"https://rili.jin10.com/details/{item.get('id', '')}",
-                        ))
-            except json.JSONDecodeError:
-                logger.warning("金十日历返回非 JSON 数据")
-        else:
-            logger.warning("金十日历请求失败: %d", resp.status_code)
-
-    except Exception as e:
-        logger.error("抓取金十日历失败: %s", e)
-
-    # 保存缓存
-    if events:
-        _save_cache("jin10_calendar", date, [vars(e) for e in events])
-
-    return events
-
-
-def fetch_jin10_flash(limit: int = 20) -> list[dict]:
-    """抓取金十快讯。
-
-    参数：
-      - limit: 返回条数
-
-    返回：快讯列表，每条包含 title, time, content, url
-    """
-    date = datetime.now(UTC).strftime("%Y-%m-%d")
-    cached = _load_cache("jin10_flash", date)
-    if cached is not None:
-        return cached[:limit]
-
-    flash_list = []
-
-    try:
-        import requests
-
-        # 金十快讯 API（可能需要登录或有访问限制）
-        url = "https://flash-api.jin10.com/get_flash_list"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-            "Referer": "https://www.jin10.com/",
-        }
-        params = {
-            "channel": "-8200",
-            "vip": "1",
-            "t": str(int(datetime.now().timestamp())),
-        }
-
-        resp = requests.get(url, headers=headers, params=params, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, dict) and "data" in data:
-                for item in data["data"][:limit]:
-                    flash_list.append({
-                        "title": item.get("title", ""),
-                        "time": item.get("time", ""),
-                        "content": item.get("content", ""),
-                        "url": item.get("url", ""),
-                        "source": "金十快讯",
-                    })
-
-    except Exception as e:
-        logger.error("抓取金十快讯失败: %s", e)
-
-    if flash_list:
-        _save_cache("jin10_flash", date, flash_list)
-
-    return flash_list
-
-
-def analyze_event_impact(event: NewsEvent) -> dict:
-    """分析财经事件对黄金的影响。
-
-    返回：影响分析结果
-    """
-    event_type = event.event_type
-    importance = EVENT_IMPORTANCE.get(event_type, "低")
-
-    # 默认影响分析
-    impact = {
-        "事件类型": event_type,
-        "重要性": importance,
-        "对黄金影响": "中性",
-        "影响逻辑": "",
-        "交易建议": "观望",
-    }
-
-    if event_type == "非农":
-        impact["影响逻辑"] = (
-            "非农数据反映美国就业市场状况。数据好于预期 → 美联储加息预期升温 → 美元走强 → 黄金承压；"
-            "数据差于预期 → 降息预期升温 → 美元走弱 → 黄金受益。"
-        )
-        impact["交易建议"] = "数据公布前 30 分钟观望，公布后根据数据方向和力度顺势操作，注意止损。"
-    elif event_type == "CPI":
-        impact["影响逻辑"] = (
-            "CPI 反映通胀水平。CPI 高于预期 → 通胀压力大 → 美联储加息预期升温 → 美元走强 → 黄金承压；"
-            "CPI 低于预期 → 通胀缓解 → 降息预期升温 → 黄金受益。"
-        )
-        impact["交易建议"] = "CPI 是黄金最重要的数据之一，波动通常较大，建议轻仓参与或观望。"
-    elif event_type == "美联储":
-        impact["影响逻辑"] = (
-            "美联储利率决议和鲍威尔讲话直接影响美元利率预期。"
-            "加息/鹰派 → 美元走强 → 黄金承压；降息/鸽派 → 美元走弱 → 黄金受益。"
-        )
-        impact["交易建议"] = "利率决议通常伴随剧烈波动，建议数据公布前平仓或严格止损。"
-    elif event_type == "GDP":
-        impact["影响逻辑"] = "GDP 反映经济整体状况。GDP 强劲 → 风险偏好上升 → 黄金避险需求下降；GDP 疲软 → 避险需求上升 → 黄金受益。"
-    elif event_type == "PCE":
-        impact["影响逻辑"] = "PCE 是美联储最关注的通胀指标，影响逻辑与 CPI 类似。"
-    elif event_type == "失业率":
-        impact["影响逻辑"] = "失业率上升 → 经济疲软 → 降息预期 → 黄金受益；失业率下降 → 经济强劲 → 加息预期 → 黄金承压。"
-    elif event_type == "零售销售":
-        impact["影响逻辑"] = "零售销售反映消费状况。数据强劲 → 经济向好 → 美元走强 → 黄金承压。"
-    elif event_type == "ISM":
-        impact["影响逻辑"] = "ISM 制造业 PMI 反映制造业景气度。PMI 高于 50 → 扩张 → 美元走强 → 黄金承压。"
-
-    return impact
-
-
-def get_today_important_events() -> list[dict]:
-    """获取今天的重要财经事件。
-
-    返回：今天的重要事件列表，每个事件附带影响分析
-    """
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
-    events = fetch_jin10_calendar(today)
-
-    important = []
-    for event in events:
-        if event.event_type != "其他" or event.importance in ("极高", "高"):
-            impact = analyze_event_impact(event)
-            important.append({
-                "事件": vars(event),
-                "影响分析": impact,
-            })
-
-    return important
-
-
-def get_upcoming_events(days: int = 3) -> list[dict]:
-    """获取未来几天的重要财经事件。
-
-    参数：
-      - days: 未来几天
-
-    返回：未来几天的重要事件列表
-    """
-    all_events = []
-    for i in range(days):
-        date = (datetime.now(UTC) + timedelta(days=i)).strftime("%Y-%m-%d")
-        events = fetch_jin10_calendar(date)
-        for event in events:
-            if event.event_type != "其他" or event.importance in ("极高", "高"):
-                all_events.append({
-                    "日期": date,
-                    "事件": vars(event),
-                    "影响分析": analyze_event_impact(event),
-                })
-
-    return all_events
-
-
-# ---------------------------------------------------------------------------
-# 备用：如果金十 API 不可用，提供手动数据输入
-# ---------------------------------------------------------------------------
-
-def create_manual_event(
-    title: str,
-    time: str,
-    country: str = "美国",
-    importance: str = "高",
-    actual: str | None = None,
-    forecast: str | None = None,
-    previous: str | None = None,
-) -> NewsEvent:
-    """手动创建一个财经事件（当 API 不可用时使用）。"""
-    return NewsEvent(
-        title=title,
-        time=time,
-        country=country,
-        importance=importance,
-        actual=actual,
-        forecast=forecast,
-        previous=previous,
-        source="手动输入",
-        url="",
-    )
-
-
-# 示例：创建本周重要事件的快速参考
-def get_weekly_important_events() -> list[dict]:
-    """获取本周重要事件参考（基于已知的美联储日程等）。"""
-    # 这是一个静态参考，实际使用时应从 API 获取
-    week_events = []
-
-    # 检查本周是否有已知的重要事件
-    now = datetime.now(UTC)
-    weekday = now.weekday()
-
-    # 非农通常在每月第一个周五
-    if weekday == 4 and now.day <= 7:  # 周五且是月初
-        week_events.append({
-            "日期": now.strftime("%Y-%m-%d"),
-            "事件": {
-                "title": "美国非农就业报告",
-                "time": "20:30",
-                "country": "美国",
-                "importance": "极高",
-                "source": "已知日程",
-            },
-            "影响分析": analyze_event_impact(create_manual_event("美国非农就业报告", "20:30", "美国", "极高")),
-        })
-
-    return week_events
