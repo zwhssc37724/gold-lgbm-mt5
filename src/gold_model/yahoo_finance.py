@@ -110,8 +110,15 @@ def get_yahoo_data(symbol: str, period: str = "1d", use_cache: bool = True) -> d
 # ---------------------------------------------------------------------------
 
 def get_gold_futures() -> dict | None:
-    """COMEX 黄金期货 (GC=F)。注意：Yahoo 免费版可能无此数据，建议用 GLD 替代。"""
-    return get_yahoo_data("GC=F")
+    """COMEX 黄金期货。GC=F 在 Yahoo 免费接口已无数据（possibly delisted），
+    失败时回落到 GLD ETF 作为黄金价格代理。"""
+    gc = get_yahoo_data("GC=F")
+    if gc is not None:
+        return gc
+    gld = get_yahoo_data("GLD")
+    if gld is not None:
+        gld["代码"] = "GLD（黄金价格代理）"
+    return gld
 
 
 def get_gold_etf() -> dict | None:
@@ -120,8 +127,16 @@ def get_gold_etf() -> dict | None:
 
 
 def get_dxy() -> dict | None:
-    """美元指数 (DX-Y.NYB)。注意：Yahoo 免费版可能无此数据，建议用 UUP 替代。"""
-    return get_yahoo_data("DX-Y.NYB")
+    """美元指数。
+
+    2026-08-30：Yahoo 免费 API 已不再返回 DX-Y.NYB（possibly delisted，
+    yfinance 每次都会打一条 ERROR 日志），直接用 UUP（美元看涨 ETF）作为代理。
+    若日后 Yahoo 恢复该符号，可改回先试 DX-Y.NYB 再回落。
+    """
+    uup = get_yahoo_data("UUP")
+    if uup is not None:
+        uup["代码"] = "UUP（美元指数代理）"
+    return uup
 
 
 def get_uup() -> dict | None:
@@ -177,12 +192,8 @@ def get_macro_indicators() -> dict:
       - 金油比
       - 黄金情绪分析
     """
-    # 优先用 DXY，失败则用 UUP
+    # get_dxy() 内部已处理 DXY→UUP 回落（含"UUP（美元指数代理）"标注）
     dxy = get_dxy()
-    if dxy is None:
-        dxy = get_uup()
-        if dxy:
-            dxy["代码"] = "UUP（美元指数代理）"
 
     us10y = get_us10y()
     vix = get_vix()

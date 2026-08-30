@@ -30,7 +30,9 @@ CACHE_DIR = config.DATA_DIR / "news_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # 金十开放平台 API Key（从 https://open.jin10.com/ 免费申请）
-JIN10_API_KEY = "sk-8N-sZOnBFiHeJWu5m06ejcYZ-fVX3X3ys9EBUmcVOqY"  # 在这里填入你的 API key，如 "sk-xxxxxxxx"
+# 注意：默认占位符不生效——真实 key 形如 sk- 后跟完整串（无省略号），
+# 占位符会被 fetch_jin10_calendar_api 识别并跳过（避免每次早报打一条必失败的请求）。
+JIN10_API_KEY = ""  # 在这里填入你的 API key，如 "sk-xxxxxxxx"
 FX678_API_KEY = ""  # 在 https://open.fx678.com 申请（付费）
 
 # 重要数据事件关键词
