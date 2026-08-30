@@ -15,14 +15,13 @@ import pytest
 SRC = Path(__file__).resolve().parent.parent / "src"
 sys.path.insert(0, str(SRC))
 
-from gold_model import config  # noqa: E402
-from gold_model.features import (  # noqa: E402
+from gold_model import config
+from gold_model.features import (
     build_features,
     build_labels,
     build_labels_3class,
 )
-from gold_model.mt5_client import filter_dense_history  # noqa: E402
-
+from gold_model.mt5_client import filter_dense_history
 
 # ---------------------------------------------------------------------------
 # 测试工具
@@ -184,7 +183,7 @@ class TestDenseFilter:
 
 class TestBacktest:
     def test_long_backtest_runs(self):
-        from gold_model.backtest import INITIAL_CAPITAL, run_backtest
+        from gold_model.backtest import run_backtest
 
         df = make_klines(500)
         sig = pd.Series(False, index=df.index)
@@ -254,6 +253,109 @@ class TestDirectionD1:
         assert X.shape[1] >= 60  # 价格特征齐全（宏观列在测试环境可能全 0）
         # 标签值域合法
         assert set(y.unique()) <= {0, 1, 2}
+
+
+# ---------------------------------------------------------------------------
+# 校准 / 漂移 / 随机对照 / swap 成本
+# ---------------------------------------------------------------------------
+
+class TestCalibration:
+    def test_fit_and_calibrate_monotone(self):
+        """isotonic 校准：分数越高校准概率越高（单调），值域 [0,1]。"""
+        from gold_model import calibration
+
+        rng = np.random.default_rng(0)
+        n = 2000
+        conf = rng.normal(0, 0.3, n)
+        # 构造真实单调关系：p(涨) = 0.4 + 0.4*sigmoid(conf*3)
+        p_true = 0.4 + 0.4 / (1 + np.exp(-conf * 3))
+        y = (rng.random(n) < p_true).astype(int)
+        # 三分类格式：y=2 涨；y=1 其余
+        y3 = np.where(y == 1, 2, 1)
+        proba = np.zeros((n, 3))
+        proba[:, 1] = 0.5
+        proba[:, 2] = 0.25 + conf / 4  # conf 由 p2-p0 重构
+        proba[:, 0] = 0.25 - conf / 4
+        calib = calibration.fit_calibrators(proba, y3)
+        scores = np.array([-0.5, 0.0, 0.5])
+        preds = calib["long"].predict(scores)
+        assert 0.0 <= preds.min() and preds.max() <= 1.0
+        assert np.all(np.diff(preds) >= -1e-9)  # 单调不减
+
+    def test_reliability_curve(self):
+        from gold_model import calibration
+
+        rng = np.random.default_rng(1)
+        scores = rng.normal(0, 0.3, 500)
+        events = (rng.random(500) < 0.5 + scores * 0.3).astype(int)
+        rel = calibration.reliability_curve(scores, events, n_bins=5)
+        assert len(rel) >= 3
+        assert all("实际命中率" in r and "平均分数" in r for r in rel)
+
+
+class TestDrift:
+    def test_build_reference_and_check(self, tmp_path, monkeypatch):
+        """参考文件落盘 + PSI 计算（用合成数据对比自身 → 稳定）。"""
+        from gold_model import drift
+
+        df = make_klines(600)
+        X = build_features(df)
+        ref_path = tmp_path / "drift_reference_test.json"
+        monkeypatch.setattr(drift, "reference_path", lambda t: ref_path)
+        drift.build_reference(X, "test")
+        assert ref_path.exists()
+
+        # PSI 基本计算：同分布应接近 0，平移分布应显著 > 0
+        rng = np.random.default_rng(2)
+        base = rng.normal(0, 1, 5000)
+        same = rng.normal(0, 1, 5000)
+        shifted = rng.normal(1.5, 1, 5000)
+        bins = np.quantile(base, np.linspace(0, 1, 11))
+        psi_same = drift._psi(base, same, bins)
+        psi_shift = drift._psi(base, shifted, bins)
+        assert psi_same < 0.05
+        assert psi_shift > 0.25
+
+
+class TestBacktestCosts:
+    def test_swap_cost_signs(self):
+        """隔夜利息：多头负（付息）、空头也是负（保守），天数越多成本越大。"""
+        from gold_model.backtest import _swap_cost
+
+        c1 = _swap_cost("long", 4000.0, 1.0, 1)
+        c5 = _swap_cost("long", 4000.0, 1.0, 5)
+        cs = _swap_cost("short", 4000.0, 1.0, 1)
+        assert c1 < 0 and c5 < c1
+        assert cs < 0
+        assert _swap_cost("long", 4000.0, 1.0, 0) == 0.0
+
+    def test_random_control_same_frequency(self):
+        from gold_model.backtest import random_control_signals
+
+        sig = pd.Series(False, index=range(1000))
+        sig.iloc[::10] = True  # 10% 频率
+        rc = random_control_signals(sig, seed=1)
+        assert 0.05 < rc.mean() < 0.15  # 频率近似保持
+        rc2 = random_control_signals(sig, seed=1)
+        assert rc.equals(rc2)  # 种子确定
+
+
+class TestWalkForwardShared:
+    def test_oos_probabilities_shape_and_order(self):
+        """共享 WF 模块：OOS 概率行号单调递增（时序不乱），purge 生效。"""
+        from gold_model.walkforward import WFConfig, oos_probabilities
+
+        rng = np.random.default_rng(3)
+        n = 1200
+        X = pd.DataFrame({"f1": rng.normal(0, 1, n), "f2": rng.normal(0, 1, n)})
+        y = pd.Series((rng.random(n) < 0.5).astype(int))
+        params = {"objective": "binary", "verbosity": -1, "seed": 1,
+                  "num_leaves": 7, "min_child_samples": 20}
+        r = oos_probabilities(X, y, params, WFConfig(n_windows=3, horizon=5, min_train=200))
+        assert len(r["proba"]) == len(r["oos_pos"])
+        assert np.all(np.diff(r["oos_pos"]) > 0)  # 严格递增
+        assert r["oos_pos"].max() == n - 1
+        assert len(r["proba"]) < n  # 只覆盖尾部 OOS 段
 
 
 if __name__ == "__main__":

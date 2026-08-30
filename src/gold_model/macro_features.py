@@ -38,25 +38,42 @@ CACHE_DIR = config.DATA_DIR / "macro_cache"
 CACHE_TTL_HOURS = 12.0
 
 
+# 宏观序列拉取起点：D1 训练数据从 2011-11 起，宏观序列必须覆盖更早（含 20 日预热窗）
+MACRO_START = "2011-01-01"
+
+
 def _cache_path(symbol: str) -> Path:
     return CACHE_DIR / f"{symbol.replace('^', 'idx_').replace('.', '_')}.parquet"
 
 
-def fetch_macro_series(symbol: str, period: str = "5y") -> pd.DataFrame | None:
-    """拉取日线序列（Close + 时间索引），带 parquet 缓存（12h）。"""
+def fetch_macro_series(
+    symbol: str,
+    period: str = "max",
+    start: str = MACRO_START,
+    cache_buster: str = "",
+) -> pd.DataFrame | None:
+    """拉取日线序列（Close + 时间索引），带 parquet 缓存（12h）。
+
+    关键修复（2026-08-30）：旧版默认 period="5y"，D1 训练（2011 起）的前 10 年
+    宏观列全是零填充的假数据。现在默认从 MACRO_START 拉全历史；缓存按
+    (symbol, start, cache_buster) 键隔离，旧短缓存自动失效重拉。
+
+    拉取失败时返回 None（调用方零填充，训练管道退化为纯价格特征）。
+    """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cp = _cache_path(symbol)
+    cache_key = f"{symbol}|{start}|{cache_buster}"
+    cp = CACHE_DIR / f"{_cache_path(symbol).stem}_{abs(hash(cache_key)) & 0xFFFFFF:06x}.parquet"
     if cp.exists():
         age_h = (pd.Timestamp.now(tz="UTC") - pd.Timestamp(cp.stat().st_mtime, unit="s", tz="UTC")).total_seconds() / 3600
         if age_h < CACHE_TTL_HOURS:
             try:
                 return pd.read_parquet(cp)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("macro cache read failed for %s: %s", symbol, exc)
     try:
         import yfinance as yf
 
-        hist = yf.Ticker(symbol).history(period=period, auto_adjust=True)
+        hist = yf.Ticker(symbol).history(start=start, auto_adjust=True)
         if hist is None or hist.empty:
             return None
         df = hist[["Close"]].copy()
@@ -64,6 +81,10 @@ def fetch_macro_series(symbol: str, period: str = "5y") -> pd.DataFrame | None:
         df.index = pd.to_datetime(df.index).tz_convert("UTC") if df.index.tz is not None else pd.to_datetime(df.index).tz_localize("UTC")
         df.index.name = "time"
         df = df[~df.index.duplicated(keep="last")].sort_index()
+        # 完整性检查：拉到的起点不得晚于请求起点太多（防止 API 静默降级回短历史）
+        first = df.index.min()
+        if first > pd.Timestamp(start, tz="UTC") + pd.Timedelta(days=30):
+            logger.warning("macro series %s starts at %s, later than requested %s", symbol, first, start)
         df.to_parquet(cp)
         return df
     except Exception as exc:
@@ -140,9 +161,7 @@ def macro_coverage(kline_index: pd.Series) -> dict:
         if t.dt.tz is None:
             t = t.dt.tz_localize("UTC")
         else:
-            t = t.dt.tz_convert("UTC")
-        shifted = series.index.to_series().shift(-1)  # 保守估计：下一数据点可用时间
-        available = series.index.searchsorted(t.to_numpy(), side="right")
+            t = t.dt_tz_convert("UTC") if hasattr(t, "dt_tz_convert") else t.dt.tz_convert("UTC")
         # 简化覆盖率：时间戳 >= 序列首日期+1天 且 <= 序列末日期 的比例
         lo = series.index[0] + pd.Timedelta(days=1)
         hi = series.index[-1]

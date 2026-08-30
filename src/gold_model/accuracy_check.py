@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import logging
 
@@ -22,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 from gold_model import config, mt5_client
-from gold_model.features import _atr, build_labels, build_labels_3class
+from gold_model.features import build_labels, build_labels_3class
 
 logger = logging.getLogger("gold_model.accuracy_check")
 
@@ -86,7 +87,7 @@ def check_breakout(ledger: pd.DataFrame, klines: pd.DataFrame) -> dict:
     bins = [0, 0.3, 0.5, 0.7, 1.0]
     p, a = np.array(probs), np.array(actuals)
     cal = []
-    for lo, hi in zip(bins[:-1], bins[1:]):
+    for lo, hi in itertools.pairwise(bins):
         m = (p >= lo) & (p < hi if hi < 1 else p <= hi)
         if m.sum() >= 3:
             cal.append({"概率区间": f"[{lo},{hi})", "样本": int(m.sum()),
@@ -137,6 +138,37 @@ def check_direction3(ledger: pd.DataFrame, klines: pd.DataFrame) -> dict:
     return out
 
 
+def check_direction_d1(ledger: pd.DataFrame, klines_d1: pd.DataFrame) -> dict:
+    """对账 direction_d1 记录（D1，horizon=5 交易日）。"""
+    recs = ledger[ledger["kind"] == "direction_d1"].copy()
+    if recs.empty:
+        return {"记录数": 0}
+    y = build_labels_3class(klines_d1, horizon=config.DIRECTION_D1_HORIZON, threshold=0)
+    time_to_idx = pd.Series(np.arange(len(klines_d1)), index=klines_d1["time"].dt.floor("D"))
+    hits, total = [], 0
+    class_map = {"看空": 0, "观望": 1, "看多": 2}
+    for _, r in recs.iterrows():
+        t = r["kline_time"]
+        if pd.isna(t):
+            continue
+        idx = time_to_idx.get(t.floor("D") if hasattr(t, "floor") else t)
+        if idx is None or idx + config.DIRECTION_D1_HORIZON >= len(klines_d1):
+            continue  # 5 日窗口未走完
+        actual = int(y.iloc[idx])
+        pred = class_map.get(str(r.get("pred_class")), None)
+        if pred is None:
+            continue
+        hits.append(actual == pred)
+        total += 1
+    if total == 0:
+        return {"记录数": len(recs), "可对账": 0, "说明": "5交易日窗口未走完或时间不匹配"}
+    return {
+        "记录数": len(recs),
+        "可对账": total,
+        "命中率": round(float(np.mean(hits)), 4),
+    }
+
+
 def run(days: int = 7) -> dict:
     ledger = load_ledger(days)
     if ledger.empty:
@@ -145,12 +177,18 @@ def run(days: int = 7) -> dict:
     if mt5_client.is_synthetic(klines):
         return {"说明": "MT5 不可用，无法对账", "台账路径": str(LEDGER)}
     klines = mt5_client.filter_dense_history(klines)
-    return {
+    out = {
         "对账窗口": f"近 {days} 天",
         "breakout": check_breakout(ledger, klines),
         "direction3": check_direction3(ledger, klines),
-        "台账路径": str(LEDGER),
     }
+    # direction_d1 需要日线数据
+    if (ledger["kind"] == "direction_d1").any():
+        d1 = mt5_client.get_klines(timeframe="D1", bars=200)
+        if not mt5_client.is_synthetic(d1):
+            out["direction_d1"] = check_direction_d1(ledger, d1)
+    out["台账路径"] = str(LEDGER)
+    return out
 
 
 def main() -> None:

@@ -36,9 +36,9 @@ import optuna
 import pandas as pd
 from sklearn.metrics import accuracy_score, roc_auc_score
 
-from gold_model import config, mt5_client
+from gold_model import calibration, config, macro_features, mt5_client
+from gold_model import drift as drift_mod
 from gold_model.features import build_features, build_labels, build_labels_3class
-from gold_model import macro_features
 
 logger = logging.getLogger("gold_model.train")
 
@@ -312,8 +312,12 @@ def walk_forward(
     params: dict,
     n_windows: int = 4,
     train_frac: float = 0.75,
+    df: pd.DataFrame | None = None,
 ) -> dict:
-    """滚动训练→滚动预测，报告多窗口指标均值±标准差。"""
+    """滚动训练→滚动预测，报告多窗口指标均值±标准差。
+
+    df（可选）：原始 K 线数据，提供后「起点」输出真实日期而非行号。
+    """
     n = len(X)
     scores: list[dict] = []
     win_size = max(int(n * (1 - train_frac) / n_windows), 200)
@@ -331,11 +335,13 @@ def walk_forward(
             callbacks=[lgb.log_evaluation(0)],
         )
         proba = model.predict(X.iloc[te_idx])
-        if spec.is_multiclass and proba.ndim > 1:
-            proba = proba
         m = _evaluate(spec, y.iloc[te_idx], np.asarray(proba))
         m["窗口"] = w
-        m["起点"] = str(X.index[te_idx[0]])
+        # 修复：此前打印 RangeIndex 行号（如 "1034"），无信息量；有 df 时输出真实日期
+        if df is not None and len(df) > te_idx[0]:
+            m["起点"] = str(pd.Timestamp(df["time"].iloc[te_idx[0]]).date())
+        else:
+            m["起点"] = str(X.index[te_idx[0]])
         scores.append(m)
         logger.info("walk-forward window %d: %s", w, {k: v for k, v in m.items() if k not in ("起点",)})
     if not scores:
@@ -389,9 +395,14 @@ def train(bars: int, trials: int, target: str, use_snapshot: bool = False) -> di
         base = base_info["准确率"]
 
     splits = purged_splits(len(X_tr), horizon=spec.horizon)
+    # Optuna study 持久化：重训时继续上次的搜索（SQLite，按 target 独立）
+    study_storage = f"sqlite:///{config.MODEL_DIR / f'optuna_{target}.db'}"
     study = optuna.create_study(
         direction=spec.optuna_direction,
         sampler=optuna.samplers.TPESampler(seed=config.RANDOM_STATE),
+        study_name=f"gold_{target}",
+        storage=study_storage,
+        load_if_exists=True,
     )
     study.optimize(make_objective(X_tr, y_tr, splits, spec), n_trials=trials, show_progress_bar=False)
     best = dict(study.best_params)
@@ -428,10 +439,23 @@ def train(bars: int, trials: int, target: str, use_snapshot: bool = False) -> di
     # Walk-forward 样本外评估
     wf_params = dict(best)
     wf_params["num_boost_round"] = 600
-    wf = walk_forward(spec, X, y, wf_params)
+    wf = walk_forward(spec, X, y, wf_params, df=df)
     logger.info("walk-forward: %s", {k: v for k, v in wf.items() if k != "逐窗口"})
 
     config.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    # 模型版本归档：覆盖前把旧模型挪到 models/archive/（带时间戳+CV分数，可回滚对比）
+    if spec.model_path.exists():
+        archive_dir = config.MODEL_DIR / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        ts = pd.Timestamp.now(tz="UTC").strftime("%Y%m%d_%H%M%S")
+        try:
+            old_bundle = joblib.load(spec.model_path)
+            old_score = float(old_bundle.get("cv_score") or 0)
+            archived = archive_dir / f"{spec.model_path.stem}_{ts}_cv{old_score:.4f}.pkl"
+        except Exception:
+            archived = archive_dir / f"{spec.model_path.stem}_{ts}_unreadable.pkl"
+        spec.model_path.replace(archived)
+        logger.info("previous model archived -> %s", archived)
     bundle = {
         "model": model,
         "features": list(X.columns),
@@ -456,6 +480,35 @@ def train(bars: int, trials: int, target: str, use_snapshot: bool = False) -> di
     joblib.dump(bundle, spec.model_path)
     config.FEATURES_PATH.write_text(json.dumps(list(X.columns), ensure_ascii=False, indent=2))
 
+    # 漂移监控参考（训练特征分位数）
+    drift_mod.build_reference(X, target)
+
+    # 概率校准（多分类任务）：在 WF 样本外概率上拟合 isotonic
+    calib_info: dict = {}
+    if spec.is_multiclass:
+        try:
+            from gold_model.walkforward import WFConfig, oos_probabilities
+
+            wf_cfg = WFConfig(n_windows=4, horizon=spec.horizon)
+            oos = oos_probabilities(X, y, wf_params, wf_cfg)
+            if len(oos["proba"]) >= 200:
+                calib = calibration.fit_calibrators(oos["proba"], y.iloc[oos["oos_pos"]].to_numpy())
+                calibration.save_calibrators(calib, spec.model_path)
+                conf_long = oos["proba"][:, 2] - oos["proba"][:, 0]
+                ev = (y.iloc[oos["oos_pos"]].to_numpy() == 2).astype(int)
+                rel = calibration.reliability_curve(conf_long, ev, n_bins=6)
+                calib_info = {
+                    "方法": "isotonic（WF 样本外拟合）",
+                    "样本数": len(oos["proba"]),
+                    "可靠性曲线(看涨)": rel,
+                }
+                logger.info("calibrators fitted on %d OOS samples", len(oos["proba"]))
+            else:
+                calib_info = {"跳过": f"OOS 样本不足（{len(oos['proba'])} < 200）"}
+        except Exception as exc:
+            calib_info = {"错误": str(exc)}
+            logger.warning("calibration failed: %s", exc)
+
     # Top-15 特征重要性
     imp = sorted(zip(X.columns, model.feature_importance("gain")), key=lambda kv: -kv[1])[:15]
     for name, gain in imp:
@@ -469,6 +522,7 @@ def train(bars: int, trials: int, target: str, use_snapshot: bool = False) -> di
         "最佳CV": {spec.metric: float(study.best_value)},
         "测试集指标": test_metrics,
         "WalkForward": wf,
+        "概率校准": calib_info,
         "模型路径": str(spec.model_path),
         "特征数量": len(X.columns),
         "训练样本数": len(X_tr),

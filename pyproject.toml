@@ -22,6 +22,7 @@ gold-train = "gold_model.train:main"
 gold-mcp = "gold_model.serve_mcp:main"
 gold-backtest = "gold_model.backtest:main"
 gold-accuracy = "gold_model.accuracy_check:main"
+gold-drift = "gold_model.drift:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -42,3 +43,19 @@ target-version = "py312"
 [tool.ruff.lint.per-file-ignores]
 # MT5 terminal interactions intentionally degrade gracefully on any failure.
 "src/gold_model/mt5_client.py" = ["BLE001", "S110"]
+# Web scraping modules (news/cftc/fred/fedwatch/gld/yahoo): every fetch degrades
+# gracefully to cache/None on any network failure by design.
+"src/gold_model/news.py" = ["BLE001", "F811", "DTZ005", "RUF007"]
+"src/gold_model/market_data.py" = ["BLE001"]
+"src/gold_model/daily_briefing.py" = ["BLE001"]
+"src/gold_model/cftc.py" = ["BLE001"]
+"src/gold_model/fred.py" = ["BLE001"]
+"src/gold_model/fedwatch.py" = ["BLE001"]
+"src/gold_model/gld_holdings.py" = ["BLE001"]
+"src/gold_model/yahoo_finance.py" = ["BLE001", "DTZ005"]
+# Macro fetch: degrade to zero-filled features when network fails (documented).
+"src/gold_model/macro_features.py" = ["BLE001"]
+# Ledger writes must never break predictions.
+"src/gold_model/serve_mcp.py" = ["BLE001"]
+# Training pipeline tolerates optional components (calibration/drift) failing.
+"src/gold_model/train.py" = ["BLE001"]

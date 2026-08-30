@@ -22,10 +22,8 @@ import logging
 import numpy as np
 import pandas as pd
 
-from gold_model import config
+from gold_model import config, macro_features, mt5_client
 from gold_model.features import build_features
-from gold_model import macro_features
-from gold_model import mt5_client
 
 logger = logging.getLogger("gold_model.backtest")
 
@@ -38,12 +36,25 @@ MAX_HOLD_BARS = 24          # 最长持仓（H1 根数，direction3 对应其预
 INITIAL_CAPITAL = 10_000.0
 POSITION_SIZE_PCT = 0.10    # 每次开仓动用资金比例（10%，无杠杆）
 
+# 隔夜利息（swap）：XAUUSD 多头典型 -2% ~ -4% 年化（借美元买金），取保守 -3.5%；
+# 空头收窄到 -1.0%（经纪商点差后多数也为负）。按持仓跨自然日数计。
+SWAP_ANNUAL_LONG = -0.035
+SWAP_ANNUAL_SHORT = -0.010
+
 POINT = 0.01  # XAUUSD 1 点
 
 
 def _cost_per_trade(price: float) -> float:
     """单边成本（点差+滑点）折算成价格单位。"""
     return (SPREAD_POINTS + SLIPPAGE_POINTS) * POINT
+
+
+def _swap_cost(direction: str, entry_px: float, size: float, days_held: int) -> float:
+    """隔夜利息成本（负=扣钱）。按自然日数计，价格单位。"""
+    if days_held <= 0:
+        return 0.0
+    rate = SWAP_ANNUAL_LONG if direction == "long" else SWAP_ANNUAL_SHORT
+    return rate / 365.0 * days_held * entry_px * size
 
 
 def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -110,15 +121,21 @@ def run_backtest(
             pnl = (px - entry_px) * size
         else:
             pnl = (entry_px - px) * size
+        # 隔夜利息：按持仓跨自然日数计
+        days_held = int((df["time"].iloc[i] - df["time"].iloc[entry_i]).total_seconds() // 86400)
+        swap = _swap_cost(direction, entry_px, size, days_held)
+        pnl += swap
         equity += pnl
         trades.append(
             {
                 "开仓K线": entry_i,
                 "平仓K线": i,
                 "持仓根数": i - entry_i,
+                "持仓天数": days_held,
                 "开仓价": round(entry_px, 2),
                 "平仓价": round(px, 2),
                 "盈亏": round(pnl, 2),
+                "其中隔夜利息": round(swap, 2),
                 "收益率": round(pnl / equity if equity else 0.0, 6),
                 "原因": reason,
             }
@@ -199,7 +216,7 @@ def _summarize(trades: pd.DataFrame, curve: pd.Series) -> dict:
     ret = curve.pct_change().dropna()
     sharpe = float(ret.mean() / ret.std() * np.sqrt(365 * 24)) if ret.std() > 0 else 0.0
     return {
-        "交易笔数": int(len(trades)),
+        "交易笔数": len(trades),
         "总收益率%": round(total_ret * 100, 2),
         "年化收益%": round(ann * 100, 2),
         "最大回撤%": round(dd * 100, 2),
@@ -213,6 +230,13 @@ def _summarize(trades: pd.DataFrame, curve: pd.Series) -> dict:
 # ---------------------------------------------------------------------------
 # 信号生成：模型 vs 基线
 # ---------------------------------------------------------------------------
+
+def random_control_signals(signals: pd.Series, seed: int) -> pd.Series:
+    """随机信号对照：与输入信号同频率、随机位置（真信号必须跑赢它的分布）。"""
+    rng = np.random.default_rng(seed)
+    freq = float(signals.fillna(False).mean())
+    return pd.Series(rng.random(len(signals)) < freq, index=signals.index)
+
 
 def model_signal(df: pd.DataFrame, model_key: str, threshold: float | None = None) -> tuple[pd.Series, str]:
     """用已训练模型对整段历史生成信号（样本内，供管道验证；样本外结论以 walk-forward 为准）。"""
@@ -292,12 +316,31 @@ def compare_strategies(use_snapshot: bool = True, models: list[str] | None = Non
                 sig, desc = model_signal(df, "breakout")
                 r = run_backtest(df, sig, direction="long")
                 results[f"模型:{desc}"] = r["统计"]
+                # 随机对照（同频率）：模型夏普必须显著高于随机对照分布才算择时有效
+                rand_sharpes = []
+                for seed in (1, 2, 3):
+                    rc = run_backtest(df, random_control_signals(sig, seed), direction="long")
+                    rand_sharpes.append(rc["统计"]["夏普(小时→年化)"])
+                results["模型:随机对照(同频率)"] = {
+                    "夏普(小时→年化)": round(float(np.mean(rand_sharpes)), 2),
+                    "夏普范围": [round(float(min(rand_sharpes)), 2), round(float(max(rand_sharpes)), 2)],
+                    "说明": "同频率随机信号均值（3种子）；模型须显著高于此",
+                }
             elif mk == "direction3":
                 (long_sig, short_sig), desc = model_signal(df, "direction3")
                 r_long = run_backtest(df, long_sig, direction="long")
                 results["模型:direction3 做多"] = r_long["统计"]
                 r_short = run_backtest(df, short_sig, direction="short")
                 results["模型:direction3 做空"] = r_short["统计"]
+                rand_sharpes = []
+                for seed in (1, 2, 3):
+                    rc = run_backtest(df, random_control_signals(long_sig, seed), direction="long")
+                    rand_sharpes.append(rc["统计"]["夏普(小时→年化)"])
+                results["模型:随机对照(做多,同频率)"] = {
+                    "夏普(小时→年化)": round(float(np.mean(rand_sharpes)), 2),
+                    "夏普范围": [round(float(min(rand_sharpes)), 2), round(float(max(rand_sharpes)), 2)],
+                    "说明": "同频率随机信号均值（3种子）；模型须显著高于此",
+                }
         except FileNotFoundError as e:
             logger.warning("跳过 %s：%s", mk, e)
 

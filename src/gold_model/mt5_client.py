@@ -175,15 +175,14 @@ def is_market_open(symbol: str = config.SYMBOL) -> dict:
             "说明": "周末休市，黄金市场周日 22:00 UTC 开市",
         }
 
-    if weekday == 6:  # Sunday
-        if now_utc.hour < 22:
-            next_open = now_utc.replace(hour=22, minute=0, second=0, microsecond=0)
-            return {
-                "状态": "weekend",
-                "当前时间": now_utc.isoformat(),
-                "下次开市": next_open.isoformat(),
-                "说明": "周末休市，今晚 22:00 UTC 开市",
-            }
+    if weekday == 6 and now_utc.hour < 22:  # Sunday before open
+        next_open = now_utc.replace(hour=22, minute=0, second=0, microsecond=0)
+        return {
+            "状态": "weekend",
+            "当前时间": now_utc.isoformat(),
+            "下次开市": next_open.isoformat() if next_open else None,
+            "说明": "周末休市，今晚 22:00 UTC 开市",
+        }
 
     # 工作日：尝试从 MT5 获取服务器时间来验证
     with _MT5_LOCK:

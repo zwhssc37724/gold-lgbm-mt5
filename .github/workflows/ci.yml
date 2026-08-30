@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: uv sync
+      - name: Lint (ruff)
+        run: uv run ruff check src/ tests/
+      - name: Tests
+        run: uv run --with pytest pytest tests/ -q
+        env:
+          # CI 无 MT5 终端：测试本身不依赖 MT5（合成数据路径）
+          CI: true

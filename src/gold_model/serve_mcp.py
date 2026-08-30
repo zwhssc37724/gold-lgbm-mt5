@@ -12,14 +12,24 @@ import json
 import logging
 import math
 import threading
-from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
 from mcp.server.mcpserver import MCPServer
 
-from gold_model import cftc, config, fedwatch, fred, gld_holdings, mt5_client, news, yahoo_finance
+from gold_model import (
+    calibration,
+    cftc,
+    config,
+    fedwatch,
+    fred,
+    gld_holdings,
+    mt5_client,
+    news,
+    yahoo_finance,
+)
+from gold_model import drift as drift_mod
 from gold_model.features import DIRECTION3_NAMES_CN, build_features
 
 logger = logging.getLogger("gold_model.mcp")
@@ -148,6 +158,7 @@ def _add_risk_fields(
     current_price: float,
     atr: float,
     direction: str = "neutral",
+    calibrated_prob: float | None = None,
 ) -> dict:
     """给预测结果添加风险管理字段。
 
@@ -155,6 +166,7 @@ def _add_risk_fields(
       - current_price: 当前价格
       - atr: 平均真实波幅（用于计算止损）
       - direction: "long" / "short" / "neutral"
+      - calibrated_prob: 校准后的方向概率（0~1）；提供时输出 1/4 Kelly 仓位建议
     """
     # 基于 ATR 的止损建议
     if direction == "long":
@@ -183,6 +195,18 @@ def _add_risk_fields(
         "风险回报比2": round(risk_reward_2, 2),
         "建议仓位": "轻仓（≤5%）" if direction != "neutral" else "观望",
     }
+
+    # 1/4 Kelly 仓位建议（需要校准概率；风报比按 2:1 的止盈计）
+    if calibrated_prob is not None and direction in ("long", "short"):
+        b = risk_reward_2  # 赔率（盈亏比）
+        p = float(calibrated_prob)
+        kelly = max(0.0, (p * (1 + b) - 1) / b)  # f* = (p(b+1)-1)/b
+        quarter = kelly / 4
+        result["风险管理"]["Kelly仓位(1/4)"] = (
+            f"{quarter * 100:.1f}% 资金（全 Kelly {kelly * 100:.1f}%，校准p={p:.2f}，赔率{b:.1f}）"
+            if quarter > 0.001
+            else f"0%（校准概率不足以覆盖赔率，p={p:.2f} 需 > {1 / (1 + b):.2f}）"
+        )
     return result
 
 
@@ -406,7 +430,22 @@ def predict_direction_3class(symbol: str = config.SYMBOL, timeframe: str = confi
         "支撑阻力": _get_support_resistance(df),
     }
 
-    _add_risk_fields(result, current_price, atr, direction=direction)
+    # 校准概率（isotonic 校准器存在时）：把原始置信度翻译成真实频率含义
+    calibrated_prob = None
+    try:
+        calib = calibration.load_calibrators(config.DIRECTION3_MODEL_PATH)
+        if calib is not None:
+            calibrated = calibration.calibrate_confidence(calib, confidence_long_short)
+            result["校准概率"] = calibrated
+            result["校准概率说明"] = "历史同置信度情形下的真实方向频率（isotonic，WF 样本外拟合）"
+            if confidence_long_short >= 0:
+                calibrated_prob = calibrated.get("看涨概率(校准)")
+            else:
+                calibrated_prob = calibrated.get("看跌概率(校准)")
+    except Exception as exc:  # 校准失败不影响预测
+        logger.warning("calibration lookup failed: %s", exc)
+
+    _add_risk_fields(result, current_price, atr, direction=direction, calibrated_prob=calibrated_prob)
     _add_market_status(result)
     _record_prediction("direction3", result)
     return result
@@ -663,6 +702,25 @@ def get_fedwatch() -> dict:
             return fred_data
 
     return fedwatch_data
+
+
+@mcp.tool()
+def check_drift(target: str = "direction3", bars: int = 500) -> dict:
+    """特征漂移检查（PSI）：近期真实行情 vs 训练时的特征分布。
+
+    模型悄悄失效不会报警——这个工具就是报警器。每次重训会自动保存训练特征
+    的分位数参考（models/drift_reference_<target>.json），此工具对比近期数据。
+
+    参数：
+      - target: direction3 / direction_d1 / breakout
+      - bars: 近期 K 线根数（默认 500）
+
+    返回：结论（稳定/轻度漂移/显著漂移）、Top10 漂移特征、PSI 阈值。
+    PSI > 0.25 的特征多时建议重训模型。
+    """
+    if target not in ("breakout", "direction3", "direction_d1"):
+        raise ValueError("target 仅支持 breakout / direction3 / direction_d1")
+    return drift_mod.check_drift(target=target, bars=bars)
 
 
 @mcp.tool()
