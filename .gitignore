@@ -2,7 +2,10 @@ models/archive/
 models/optuna_*.db
 models/drift_reference_*.json
 models/*.calib.pkl
+models/*.pkl
 .ai-memory/
 .idea/
 __pycache__/
 .pytest_cache/
+data/
+*.log
