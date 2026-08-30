@@ -96,7 +96,12 @@ def _build_input_row(symbol: str, timeframe: str, bundle: dict) -> pd.DataFrame:
         raise RuntimeError(
             "MT5 数据不可用，当前为合成数据——拒绝预测。请检查 MT5 终端连接后再试。"
         )
-    X = build_features(df)
+    X_price = build_features(df)
+    # 宏观特征（与训练一致；拉取失败时退化为 0 值列）
+    from gold_model import macro_features
+
+    X_macro = macro_features.build_macro_features(df["time"])
+    X = pd.concat([X_price.reset_index(drop=True), X_macro], axis=1)
     feats = [c for c in bundle["features"] if c in X.columns]
     row = X[feats].iloc[-1:].astype(float).replace([np.inf, -np.inf], 0.0).fillna(0.0)
     return row, df
@@ -374,7 +379,11 @@ def predict_direction_3class(symbol: str = config.SYMBOL, timeframe: str = confi
         "K线时间": str(df["time"].iloc[-1]),
         "模型": "LightGBM + Optuna（三分类）",
         "预测周期": f"未来 {bundle.get('horizon', 24)} 根 K 线（{bundle.get('horizon', 24) * 60} 分钟）",
-        "分类阈值": f"±{bundle.get('threshold', 0.003) * 100:.2f}%",
+        "分类阈值": (
+            "自适应（ATR24 中位数×1.0）"
+            if bundle.get("adaptive_threshold")
+            else f"±{float(bundle.get('threshold') or 0.003) * 100:.2f}%"
+        ),
         "支撑阻力": _get_support_resistance(df),
     }
 

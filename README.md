@@ -26,8 +26,8 @@ uv run gold-mcp                          # 启动 MCP 服务
 
 | 工具 | 任务 | 含义 | 真实数据样本外表现 |
 |---|---|---|---|
-| `predict` | 波动扩张（breakout，二分类） | 下一根 K 线振幅是否突破近 100 根中位数 | 测试集 AUC ≈ **0.765** |
-| `predict_direction_3class` | 方向三分类（看空/观望/看多） | 未来 24 根 H1 K 线（约 1 个交易日）的方向 | 测试集宏平均 OvR AUC、见训练日志 |
+| `predict` | 波动扩张（breakout，二分类） | 下一根 K 线振幅是否突破近 100 根中位数 | 测试集 AUC **0.764**，walk-forward 0.771±0.016，超基线 0.652 |
+| `predict_direction_3class` | 方向三分类（看空/观望/看多） | 未来 24 根 H1 K 线（约 1 个交易日）的方向 | 宏AUC 0.539±0.038，**未超基线**，信号仅供参考 |
 
 ### 方向三分类标签定义
 
@@ -96,14 +96,34 @@ uv run gold-mcp                          # 启动 MCP 服务
 
 ## 评估协议（防泄漏）
 
-1. **数据**：MT5 终端拉取 XAUUSD H1 K 线，23,328 根（2011-11 至今，受终端历史深度限制）
-2. **时序切分**：末 20% 为不打扰的测试集；训练窗口内做 5 折**扩展窗** CV（训练永远早于验证）
-3. **调参**：Optuna TPE，25–60 trials，每 trial 跑 5 折平均
-4. **最终训练**：用最佳超参在训练窗口重训，仅在测试集上报告一次指标
+1. **数据**：MT5 拉取 XAUUSD H1，经月度密度过滤剔除伪装成 H1 的日线历史后 20,176 根（2023-04 至今，经纪商仅提供 2023-03 之后的真实 H1 深度）；存 parquet 快照保证可复现
+2. **防泄漏切分**：末 20% 为不打扰的测试集；训练窗口内 5 折**扩展窗** CV，train 尾部 **purge** horizon 根 + **embargo** 24 根，杜绝前瞻标签跨界
+3. **调参**：Optuna TPE，40 trials，每 trial 5 折平均
+4. **Walk-forward**：额外做 4 窗口滚动训练→滚动预测，报告均值±标准差（防单窗口运气）
+5. **朴素基线**：breakout 对比波动率动量基线，direction3 对比多数类基线；模型必须显著超越基线才算有效
+6. **宏观特征**：DXY / US10Y / VIX / GLD 日线特征，`shift(1)` + `merge_asof(backward)` 防泄漏对齐到 H1
+
+### 当前模型表现（2026-08-30，干净数据重训）
+
+| 模型 | 测试集 | Walk-forward | 基线 | 结论 |
+|---|---|---|---|---|
+| breakout | AUC 0.764 | 0.771 ± 0.016（4窗口） | 0.652（波动率动量） | **有效**，显著超基线 |
+| direction3 | 准确率 0.374 | 宏AUC 0.539 ± 0.038 | 0.385（多数类） | **无效**，未超基线（诚实结论：H1 方向本质难预测） |
+
+### 回测（含成本：点差 25 点 + 滑点 5 点/边）
+
+| 策略 | 年化收益 | 最大回撤 | 夏普 |
+|---|---|---|---|
+| 买入持有 | 27.2% | -28.8% | 1.62 |
+| 均线交叉（基线） | 0.5% | -1.2% | 1.07 |
+| direction3 做多 | 2.7% | -3.2% | 1.85 |
+| direction3 做空 | 1.1% | -0.7% | 2.25 |
+
+> 回测为样本内信号验证（2023-04 ~ 2026-08），牛市里跑不赢买入持有属正常；模型价值在低回撤与做空腿。`uv run gold-backtest --model all` 复现。
 
 ---
 
-## 特征工程（65 维）
+## 特征工程（81 维 = 65 价格 + 16 宏观）
 
 | 类别 | 特征 |
 |---|---|
@@ -121,6 +141,7 @@ uv run gold-mcp                          # 启动 MCP 服务
 | 动量加速度 | `mom_accel_12/24` |
 | 波动率比率 | `vol_ratio_12_168`、`vol_ratio_24_72` |
 | K 线动量 | `body_mom_3/6`、`wick_ratio` |
+| 宏观驱动 | `macro_dxy/us10y/vix/gld` 各 4 项：`ret5/ret20/z20/ma20_bias`（日线级，防泄漏对齐） |
 
 ---
 
@@ -130,10 +151,12 @@ uv run gold-mcp                          # 启动 MCP 服务
 E:\Documents\PythonProjects\gold-lgbm-mt5\
 ├── pyproject.toml
 ├── README.md
+├── tests/test_pipeline.py     # 13 项单元测试（标签/防泄漏/过滤/回测/台账）
 ├── src/gold_model/
 │   ├── config.py             # 周期/阈值/路径配置
-│   ├── mt5_client.py         # MT5 报价 + K 线；终端离线时回退合成数据
-│   ├── features.py           # 65 维特征 + 二分类/三分类标签
+│   ├── mt5_client.py         # MT5 报价 + K 线（线程锁/连接复用/来源标记/密度过滤）
+│   ├── features.py           # 65 维价格特征 + 二分类/三分类标签（自适应阈值）
+│   ├── macro_features.py     # 宏观特征（DXY/US10Y/VIX/GLD，防泄漏对齐）
 │   ├── news.py               # 财经日历/快讯抓取 + 非农/CPI 事件影响分析
 │   ├── yahoo_finance.py      # Yahoo Finance 宏观数据（GLD/UUP/VIX/美债等）
 │   ├── cftc.py               # CFTC 黄金持仓报告（每周五更新）
@@ -141,23 +164,40 @@ E:\Documents\PythonProjects\gold-lgbm-mt5\
 │   ├── gld_holdings.py       # SPDR GLD 黄金 ETF 持仓量
 │   ├── fedwatch.py           # CME FedWatch 利率概率
 │   ├── daily_briefing.py     # 每日黄金早报生成器
-│   ├── train.py              # Optuna + LightGBM 训练管线（支持二/三分类）
-│   └── serve_mcp.py          # HTTP MCP 服务（中文输出）
+│   ├── train.py              # Optuna + LightGBM 训练（purge/embargo + walk-forward + 基线）
+│   ├── backtest.py           # 向量化回测器（点差/滑点/ATR 止损止盈）
+│   ├── accuracy_check.py     # 预测对账（周度命中率/校准）
+│   └── serve_mcp.py          # HTTP MCP 服务（中文输出，模型热更新，预测落盘）
+├── data/
+│   ├── xauusd_h1_snapshot.parquet   # 训练数据快照（可复现）
+│   └── prediction_ledger.jsonl      # 预测台账（周度对账用）
 ├── models/
 │   ├── gold_lgbm_breakout.pkl     # 波动扩张模型
 │   ├── gold_lgbm_direction3.pkl   # 方向三分类模型
+│   ├── train_report_*.json        # 训练报告（含基线对比/walk-forward）
 │   └── features.json              # 特征列清单
-├── train_full.log            # 突破模型训练日志
-└── train_dir3.log            # 三分类模型训练日志
+└── data/reports/backtest_report.json  # 最近一次回测报告
+```
+
+### 常用命令
+
+```bash
+uv run gold-train --target breakout --use-snapshot   # 重训（复用数据快照）
+uv run gold-backtest --model all                     # 回测：模型 vs 基线 vs 买入持有
+uv run gold-accuracy --days 7                        # 预测对账（命中率/校准）
+uv run --with pytest pytest tests/ -q                # 单元测试
+uv run gold-mcp                                       # 启动 MCP 服务
 ```
 
 ---
 
 ## 已知限制
 
-- MT5 终端必须已安装并登录，否则服务自动回退到确定性合成数据（`来源` 字段会标明），模型预测会与合成数据相吻合，但不构成实盘可用信号
-- 模型预测的是**条件概率**，不构成投资建议；实盘前需自行做含点差/滑光/手续费的策略级回测
-- `predict` 工具在 `_load_model` 失败时返回明确错误指引，请按提示先训练模型
+- MT5 终端必须已安装并登录。数据不可用时：K 线/报价工具返回合成数据并明确标注（`数据来源: 合成数据`）；**预测工具直接拒绝服务**（防止用假数据出信号）
+- 经纪商 H1 历史深度有限：2023-03 之前的"H1"实际是伪装的日线（已自动过滤），干净样本只有约 3.4 年
+- **direction3 模型未超过多数类基线**（walk-forward 宏AUC 0.539），方向信号仅作参考，不应单独作为开仓依据；breakout 模型（波动扩张）已验证有效
+- 模型预测的是**条件概率**，不构成投资建议；回测含点差/滑点，但不含隔夜利息与滑点极端情况
+- 模型缓存按文件 mtime 自动失效，重训后无需重启服务
 - 金十/FX678 的免费 API 不稳定，建议申请金十开放平台 API key（https://open.jin10.com/）以获得稳定数据
 - 非农/CPI 等数据公布时间基于美国夏令时（3月-11月），冬令时（11月-3月）会推迟 1 小时
 

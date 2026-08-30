@@ -63,5 +63,21 @@
   "vol_ratio_24_72",
   "body_mom_3",
   "body_mom_6",
-  "wick_ratio"
+  "wick_ratio",
+  "macro_dxy_ret5",
+  "macro_dxy_ret20",
+  "macro_dxy_z20",
+  "macro_dxy_ma20_bias",
+  "macro_us10y_ret5",
+  "macro_us10y_ret20",
+  "macro_us10y_z20",
+  "macro_us10y_ma20_bias",
+  "macro_vix_ret5",
+  "macro_vix_ret20",
+  "macro_vix_z20",
+  "macro_vix_ma20_bias",
+  "macro_gld_ret5",
+  "macro_gld_ret20",
+  "macro_gld_z20",
+  "macro_gld_ma20_bias"
 ]
