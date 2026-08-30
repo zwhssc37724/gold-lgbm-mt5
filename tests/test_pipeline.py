@@ -81,6 +81,14 @@ class TestLabels:
         # 自适应标签值域合法
         assert set(y_adapt.unique()) <= {0, 1, 2}
 
+    def test_d1_label_horizon(self):
+        """D1 标签：horizon=5（未来 5 个交易日）。"""
+        df = make_klines(300)
+        y = build_labels_3class(df, horizon=5, threshold=0.003)
+        fwd = np.log(df["close"].shift(-5) / df["close"])
+        assert (y[fwd > 0.003] == 2).all()
+        assert (y[fwd < -0.003] == 0).all()
+
 
 # ---------------------------------------------------------------------------
 # 防泄漏
@@ -215,11 +223,37 @@ class TestLedger:
         monkeypatch.setattr(serve_mcp, "PREDICTION_LEDGER", tmp_path / "ledger.jsonl")
         serve_mcp._record_prediction("breakout", {"信号": "预期扩张", "扩张概率": 0.7, "最新收盘价": 4000.0, "K线时间": "2026-01-01"})
         serve_mcp._record_prediction("direction3", {"信号": "x", "看空概率": 0.2, "观望概率": 0.3, "看多概率": 0.5, "预测类别": "看多", "最新收盘价": 4000.0, "K线时间": "2026-01-01"})
+        serve_mcp._record_prediction("direction_d1", {"信号": "y", "看空概率": 0.3, "观望概率": 0.5, "看多概率": 0.2, "预测类别": "观望", "最新收盘价": 4000.0, "K线时间": "2026-01-01"})
         lines = (tmp_path / "ledger.jsonl").read_text(encoding="utf-8").strip().splitlines()
-        assert len(lines) == 2
+        assert len(lines) == 3
         import json
         rec = json.loads(lines[0])
         assert rec["kind"] == "breakout" and rec["probability"] == 0.7
+        rec3 = json.loads(lines[2])
+        assert rec3["kind"] == "direction_d1" and rec3["pred_class"] == "观望"
+
+
+class TestDirectionD1:
+    def test_d1_spec_wiring(self):
+        """direction_d1 目标接线：模型路径/horizon/数据集。"""
+        from gold_model import train
+
+        spec = train._spec_for("direction_d1")
+        assert spec.name == "direction_d1"
+        assert spec.is_multiclass
+        assert spec.horizon == config.DIRECTION_D1_HORIZON == 5
+        assert spec.model_path == config.DIRECTION_D1_MODEL_PATH
+
+    def test_d1_build_dataset(self):
+        """D1 数据集构建：标签 horizon=5、特征列与 H1 同构。"""
+        from gold_model import train
+
+        df = make_klines(400)
+        X, y = train.build_dataset(df, target="direction_d1")
+        assert len(X) == len(y)
+        assert X.shape[1] >= 60  # 价格特征齐全（宏观列在测试环境可能全 0）
+        # 标签值域合法
+        assert set(y.unique()) <= {0, 1, 2}
 
 
 if __name__ == "__main__":

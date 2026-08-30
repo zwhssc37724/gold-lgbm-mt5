@@ -74,7 +74,12 @@ _MODEL_CACHE: dict[str, tuple[float, object]] = {}
 
 def _load_model(path_key: str):
     """加载模型并按文件 mtime 自动失效（重新训练后无需重启服务）。"""
-    path = config.BREAKOUT_MODEL_PATH if path_key == "breakout" else config.DIRECTION3_MODEL_PATH
+    paths = {
+        "breakout": config.BREAKOUT_MODEL_PATH,
+        "direction3": config.DIRECTION3_MODEL_PATH,
+        "direction_d1": config.DIRECTION_D1_MODEL_PATH,
+    }
+    path = paths[path_key]
     if not path.exists():
         raise FileNotFoundError(
             f"模型未找到：{path}。请先运行 `uv run gold-train --target {path_key}`"
@@ -404,6 +409,75 @@ def predict_direction_3class(symbol: str = config.SYMBOL, timeframe: str = confi
     _add_risk_fields(result, current_price, atr, direction=direction)
     _add_market_status(result)
     _record_prediction("direction3", result)
+    return result
+
+
+@mcp.tool()
+def predict_direction_d1(symbol: str = config.SYMBOL) -> dict:
+    """日线方向三分类预测：未来 5 个交易日的方向 — 看空 / 观望 / 看多。
+
+    定位（2026-08-30 实验结论，experiments/ + data/reports/）：
+      - 单独交易无效：WF 宏 AUC 0.559 高于基线 0.5（5 窗口全部 >0.5），
+        但含成本回测夏普 3.74 与「随机同频率开多」对照（3.22-4.28）无显著差异
+        ——独立使用只是黄金多头 beta。
+      - 正确用法是当 H1 方向信号的过滤器（样本外 2025-10~2026-08 交叉验证）：
+        H1 置信度>0.25 的多头信号，叠加本模型「看多」（conf>0）后命中率 95%（19/20，n=20）；
+        不加过滤为 86.6%。本模型看空时 H1 信号命中率跌到 65%（n=46）。
+      - 因此本工具输出的是「过滤意见」而非独立开仓信号。
+
+    返回字段：
+      - 看空/观望/看多概率（三类分布）
+      - 预测类别、看多减看空置信度
+      - 过滤意见：可与 H1 高置信多头信号叠加 / 中性 / 与多头信号相反（建议放弃）
+      - 风险管理（D1 尺度 ATR）、支撑阻力（近 20 日）、市场状态
+    """
+    bundle = _load_model("direction_d1")
+    row, df = _build_input_row(symbol, "D1", bundle)
+    proba_vec = np.asarray(bundle["model"].predict(row)[0], dtype=float)
+    pred_class = int(np.argmax(proba_vec))
+    quote = mt5_client.get_quote(symbol)
+    confidence = float(proba_vec[2] - proba_vec[0])
+    current_price = float(df["close"].iloc[-1])
+    atr = _get_atr(df)
+
+    direction_map = {0: "short", 1: "neutral", 2: "long"}
+    direction = direction_map[pred_class]
+
+    if confidence > 0.0:
+        filter_opinion = "与 H1 多头信号同向（可叠加：历史命中 95% vs 不叠加 86.6%）"
+    elif confidence > -0.25:
+        filter_opinion = "中性（对本模型置信度不足，过滤效果未验证）"
+    else:
+        filter_opinion = "与 H1 多头信号相反（历史该情形 H1 命中率降至 65%，建议放弃或减仓）"
+
+    result = {
+        "品种": symbol,
+        "周期": "D1",
+        "目标": "方向三分类（未来 5 个交易日）",
+        "看空概率": round(float(proba_vec[0]), 4),
+        "观望概率": round(float(proba_vec[1]), 4),
+        "看多概率": round(float(proba_vec[2]), 4),
+        "信号": DIRECTION3_SIGNAL_CN[pred_class],
+        "预测类别": DIRECTION3_NAMES_CN[pred_class],
+        "看多减看空置信度": round(confidence, 4),
+        "过滤意见": filter_opinion,
+        "独立性说明": "本模型单独交易无效（=多头beta）；仅作为 H1 高置信信号的过滤器使用",
+        "最新收盘价": round(current_price, 2),
+        "实时报价": quote,
+        "K线时间": str(df["time"].iloc[-1]),
+        "模型": "LightGBM + Optuna（D1 三分类）",
+        "预测周期": f"未来 {bundle.get('horizon', 5)} 个交易日",
+        "分类阈值": (
+            "自适应（ATR24 中位数×1.0）"
+            if bundle.get("adaptive_threshold")
+            else f"±{float(bundle.get('threshold') or 0.003) * 100:.2f}%"
+        ),
+        "支撑阻力": _get_support_resistance(df, window=20),
+    }
+
+    _add_risk_fields(result, current_price, atr, direction=direction)
+    _add_market_status(result)
+    _record_prediction("direction_d1", result)
     return result
 
 

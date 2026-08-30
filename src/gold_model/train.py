@@ -80,6 +80,17 @@ def _spec_for(target: str) -> TargetSpec:
             model_path=config.DIRECTION3_MODEL_PATH,
             horizon=config.DIRECTION3_HORIZON,
         )
+    if target == "direction_d1":
+        return TargetSpec(
+            name="direction_d1",
+            is_multiclass=True,
+            num_class=3,
+            objective="multiclass",
+            metric="multi_logloss",
+            optuna_direction="minimize",
+            model_path=config.DIRECTION_D1_MODEL_PATH,
+            horizon=config.DIRECTION_D1_HORIZON,
+        )
     raise ValueError(f"unknown target: {target}")
 
 
@@ -110,6 +121,29 @@ def load_raw_bars(bars: int, use_snapshot: bool = False) -> pd.DataFrame:
     return df
 
 
+def load_raw_bars_d1(bars: int = 6000, use_snapshot: bool = False) -> pd.DataFrame:
+    """拉取原生 D1 K 线（2011 年至今 ~3800 根）：优先复用快照。"""
+    if use_snapshot and config.DATA_SNAPSHOT_D1.exists():
+        df = pd.read_parquet(config.DATA_SNAPSHOT_D1)
+        if mt5_client.is_market_open()["状态"] != "weekend" and df["time"].iloc[-1] < (
+            pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=3)
+        ):
+            logger.info("D1 snapshot is stale (>3d), refetching")
+        else:
+            logger.info("using D1 snapshot: %d bars, %s ~ %s", len(df), df["time"].iloc[0], df["time"].iloc[-1])
+            return df
+    df = mt5_client.get_klines(symbol=config.SYMBOL, timeframe="D1", bars=bars)
+    if mt5_client.is_synthetic(df):
+        raise RuntimeError("MT5 不可用且无 D1 快照：拒绝用合成数据训练。请先连接 MT5 终端。")
+    if config.DENSE_HISTORY:
+        df = mt5_client.filter_dense_history(df, timeframe="D1")
+    df = df.reset_index(drop=True)
+    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(config.DATA_SNAPSHOT_D1)
+    logger.info("D1 snapshot saved: %d bars, %s ~ %s", len(df), df["time"].iloc[0], df["time"].iloc[-1])
+    return df
+
+
 def build_dataset(df: pd.DataFrame, target: str) -> tuple[pd.DataFrame, pd.Series]:
     """特征 + 标签（含宏观特征），返回对齐后的 X, y。"""
     X_price = build_features(df)
@@ -118,6 +152,8 @@ def build_dataset(df: pd.DataFrame, target: str) -> tuple[pd.DataFrame, pd.Serie
 
     if target == "direction3":
         y = build_labels_3class(df, threshold=0)  # 自适应阈值
+    elif target == "direction_d1":
+        y = build_labels_3class(df, horizon=config.DIRECTION_D1_HORIZON, threshold=0)
     else:
         y = build_labels(df, horizon=config.BREAKOUT_HORIZON, target=target)
 
@@ -319,10 +355,13 @@ def walk_forward(
 
 def train(bars: int, trials: int, target: str, use_snapshot: bool = False) -> dict:
     spec = _spec_for(target)
-    df = load_raw_bars(bars, use_snapshot=use_snapshot)
+    if target == "direction_d1":
+        df = load_raw_bars_d1(bars=6000, use_snapshot=use_snapshot)
+    else:
+        df = load_raw_bars(bars, use_snapshot=use_snapshot)
     X, y = build_dataset(df, target=target)
 
-    if target == "direction3":
+    if target in ("direction3", "direction_d1"):
         dist = y.value_counts(normalize=True).sort_index().to_dict()
         logger.info(
             "dataset ready: target=%s, %d samples, %d features, 三类分布=%s",
@@ -401,10 +440,10 @@ def train(bars: int, trials: int, target: str, use_snapshot: bool = False) -> di
         "is_multiclass": spec.is_multiclass,
         "num_class": spec.num_class,
         "symbol": config.SYMBOL,
-        "timeframe": config.TIMEFRAME,
+        "timeframe": "D1" if target == "direction_d1" else config.TIMEFRAME,
         "horizon": spec.horizon,
-        "threshold": "adaptive(ATR24 median)" if target == "direction3" else None,
-        "adaptive_threshold": target == "direction3",
+        "threshold": "adaptive(ATR24 median)" if target in ("direction3", "direction_d1") else None,
+        "adaptive_threshold": target in ("direction3", "direction_d1"),
         "train_date": pd.Timestamp.now(tz="UTC").isoformat(),
         "train_samples": len(X_tr),
         "test_samples": len(X_te),
@@ -458,9 +497,10 @@ def main() -> None:
     parser.add_argument("--trials", type=int, default=config.N_TRIALS)
     parser.add_argument(
         "--target",
-        choices=["breakout", "direction3"],
+        choices=["breakout", "direction3", "direction_d1"],
         default="breakout",
-        help="breakout：二分类，预测下一根 K 线波动扩张；direction3：三分类，看空/观望/看多",
+        help="breakout：二分类，预测下一根 K 线波动扩张；direction3：三分类，看空/观望/看多；"
+             "direction_d1：日线三分类，未来 5 个交易日方向",
     )
     parser.add_argument("--use-snapshot", action="store_true", help="复用 data/ 下的数据快照（不重新拉取）")
     args = parser.parse_args()
