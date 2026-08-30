@@ -102,6 +102,49 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out["dow_sin"] = np.sin(2 * np.pi * t.dt.dayofweek / 5)
     out["dow_cos"] = np.cos(2 * np.pi * t.dt.dayofweek / 5)
 
+    # ====== 新增特征 ======
+
+    # 支撑阻力距离特征
+    for w in (10, 20, 50):
+        recent_high = high.rolling(w).max()
+        recent_low = low.rolling(w).min()
+        out[f"dist_to_high_{w}"] = (recent_high - close) / close
+        out[f"dist_to_low_{w}"] = (close - recent_low) / close
+        out[f"range_position_{w}"] = (close - recent_low) / (recent_high - recent_low).replace(0, np.nan)
+
+    # 斐波那契回撤位置（基于最近 50 根的高低点）
+    fib_high = high.rolling(50).max()
+    fib_low = low.rolling(50).min()
+    fib_range = fib_high - fib_low
+    fib_range = fib_range.replace(0, np.nan)
+    out["fib_236"] = (close - (fib_high - 0.236 * fib_range)) / close
+    out["fib_382"] = (close - (fib_high - 0.382 * fib_range)) / close
+    out["fib_500"] = (close - (fib_high - 0.500 * fib_range)) / close
+    out["fib_618"] = (close - (fib_high - 0.618 * fib_range)) / close
+
+    # 趋势强度（ADX 简化版）
+    plus_dm = high.diff().clip(lower=0)
+    minus_dm = (-low.diff()).clip(lower=0)
+    tr = _atr(df, 14) * close  # 还原 ATR 为价格单位
+    out["adx_plus"] = (plus_dm.ewm(alpha=1/14, adjust=False).mean() / tr.replace(0, np.nan)).fillna(0.0)
+    out["adx_minus"] = (minus_dm.ewm(alpha=1/14, adjust=False).mean() / tr.replace(0, np.nan)).fillna(0.0)
+    out["adx_diff"] = out["adx_plus"] - out["adx_minus"]
+
+    # 价格动量加速度
+    out["mom_accel_12"] = close.pct_change(12).diff()
+    out["mom_accel_24"] = close.pct_change(24).diff()
+
+    # 波动率比率（短期/长期）
+    out["vol_ratio_12_168"] = (out["vol_12"] / out["vol_168"].replace(0, np.nan)).fillna(1.0)
+    out["vol_ratio_24_72"] = (out["vol_24"] / out["vol_72"].replace(0, np.nan)).fillna(1.0)
+
+    # K线实体动量
+    out["body_mom_3"] = (out["body_ratio"].rolling(3).mean()).fillna(0.0)
+    out["body_mom_6"] = (out["body_ratio"].rolling(6).mean()).fillna(0.0)
+
+    # 上下影线比率（情绪指标）
+    out["wick_ratio"] = (out["upper_wick"] / (out["lower_wick"] + 0.001)).fillna(1.0)
+
     return out.replace([np.inf, -np.inf], 0.0)
 
 
@@ -127,12 +170,32 @@ def build_labels(df: pd.DataFrame, horizon: int = 1, target: str = "direction") 
 def build_labels_3class(
     df: pd.DataFrame, horizon: int = 24, threshold: float = 0.003
 ) -> pd.Series:
-    """方向三分类标签：0=看空（跌超阈值）、1=观望（在阈值内）、2=看多（涨超阈值）。"""
+    """方向三分类标签：0=看空（跌超阈值）、1=观望（在阈值内）、2=看多（涨超阈值）。
+
+    threshold 传 0（或 None）时启用自适应阈值：阈值 = 近 24 根 ATR(%) 中位数
+    乘以 ADAPTIVE_THRESHOLD_ATR_MULT（config，默认 1.0）。金价波动放大时
+    "观望带"同步放宽，标签分布不随波动率漂移。训练时应传 0 以逐样本自适应。
+    """
     from gold_model import config  # 延迟导入
 
     horizon = horizon or config.DIRECTION3_HORIZON
-    threshold = threshold or config.DIRECTION3_THRESHOLD
-    fwd = np.log(df["close"].shift(-horizon) / df["close"])
+    close = df["close"]
+    fwd = np.log(close.shift(-horizon) / close)
+
+    if not threshold:
+        atr_pct = _atr(df, 14) / close
+        thr_series = (
+            atr_pct.rolling(24).median() * config.ADAPTIVE_THRESHOLD_ATR_MULT
+        )
+        # 逐样本自适应阈值；无效值回退到全局固定阈值
+        thr_series = thr_series.where(
+            thr_series.notna() & (thr_series > 0), config.DIRECTION3_THRESHOLD
+        )
+        labels = pd.Series(1, index=df.index, dtype=int)
+        labels[fwd > thr_series] = 2
+        labels[fwd < -thr_series] = 0
+        return labels
+
     labels = pd.Series(1, index=df.index, dtype=int)  # 默认观望
     labels[fwd > threshold] = 2  # 看多
     labels[fwd < -threshold] = 0  # 看空

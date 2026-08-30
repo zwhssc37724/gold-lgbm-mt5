@@ -49,16 +49,48 @@ uv run gold-mcp                          # 启动 MCP 服务
 
 ## MCP 工具列表（http://127.0.0.1:8000/mcp）
 
-| 工具名 | 说明 | 返回字段（中文） |
+| 工具名 | 说明 | 返回字段（全中文） |
 |---|---|---|
-| `get_quote(symbol)` | MT5 实时报价 | 买价、卖价、最新价、时间、数据来源 |
-| `get_klines(symbol, timeframe, bars)` | MT5 K 线 | time/open/high/low/close/tick_volume/spread |
-| `predict(symbol, timeframe)` | 波动扩张预测 | 扩张概率、信号、最新收盘价、实时报价、K线时间 |
-| `predict_direction_3class(symbol, timeframe)` | 方向三分类预测 | 看空概率、观望概率、看多概率、信号、预测类别、看多减看空置信度、最新收盘价、实时报价、K线时间 |
+| `get_quote(symbol)` | MT5 实时报价 | 品种、买价、卖价、最新价、时间、数据来源、数据新鲜度、市场状态 |
+| `get_klines(symbol, timeframe, bars, 范围)` | MT5 K 线 | 数据（时间、开盘价、最高价、最低价、收盘价、成交量、点差）、统计、市场状态 |
+| `get_klines(范围="一周")` | 按时间范围取 K 线（近一周数据） | 同上，一周 = 近 5 个交易日 |
+| `get_klines_summary(symbol, timeframe)` | K 线摘要（不返回原始数据） | 最新价格、24小时高低点、涨跌、成交量、ATR、支撑阻力、市场状态 |
+| `get_market_status()` | 获取市场状态 | 状态（开市/休市/周末）、当前时间、下次开市、说明 |
+| `predict(symbol, timeframe)` | 波动扩张预测 | 品种、周期、目标、扩张概率、信号、最新收盘价、实时报价、K线时间、模型、支撑阻力、风险管理、市场状态 |
+| `predict_direction_3class(symbol, timeframe)` | 方向三分类预测 | 品种、周期、目标、看空概率、观望概率、看多概率、信号、预测类别、看多减看空置信度、最新收盘价、实时报价、K线时间、模型、预测周期、分类阈值、支撑阻力、风险管理、市场状态 |
+| `get_today_events()` | 获取今天的重要财经事件 | 日期、事件数量、事件列表（含影响分析）、市场状态 |
+| `get_upcoming_events(days)` | 获取未来几天的重要财经事件 | 查询范围、事件数量、事件列表（含影响分析）、市场状态 |
+| `get_flash_news(limit)` | 获取最新金十快讯 | 数量、快讯列表、市场状态 |
+| `analyze_event(title, country)` | 分析特定财经事件对黄金的影响 | 事件、国家、事件类型、重要性、影响分析（含交易建议）、市场状态 |
+| `get_macro_data()` | 获取宏观数据汇总 | 美元指数、美债收益率、VIX、金银比、金油比、黄金情绪、市场状态 |
+| `get_cftc_position()` | 获取 CFTC 黄金持仓报告 | 报告日期、非商业净多头、净多头变化、情绪判断、数据来源 |
+| `get_real_yield()` | 获取美债实际收益率 | 实际收益率、通胀预期、名义收益率、分析、数据来源 |
+| `get_gld_holdings()` | 获取 GLD 黄金 ETF 持仓量 | 持仓量（吨）、持仓量（盎司）、日期、数据来源 |
+| `get_fedwatch()` | 获取 CME FedWatch 利率概率 | 当前利率、市场预期、数据来源 |
+| `get_comprehensive_analysis()` | 获取黄金综合分析（所有数据源汇总） | MT5模型预测、宏观数据、黄金情绪、CFTC持仓、实际收益率、GLD持仓、利率预期、市场状态、时间 |
 
 信号含义：
 - 波动扩张：`预期扩张`（≥0.6）/ `预期收敛`（≤0.4）/ `中性`
 - 方向三分类：`看空（开空仓）` / `观望（不操作）` / `看多（开多仓）`
+
+风险管理字段（所有预测工具都包含）：
+- 当前价格、ATR（平均波幅）
+- 建议止损、建议止盈1（1:1）、建议止盈2（2:1）
+- 风险回报比1、风险回报比2、建议仓位
+
+`范围` 参数（可选值与换算，一周 = 近 5 个交易日）：
+
+| 范围 | M15 | H1 | H4 | D1 |
+|---|---|---|---|---|
+| 一天 | 96 根 | 24 根 | 6 根 | — |
+| 一周 | 480 根 | 120 根 | 30 根 | 10 根 |
+| 一个月 | 2,112 根 | 528 根 | 132 根 | 22 根 |
+| 三个月 | 6,336 根 | 1,584 根 | 396 根 | 66 根 |
+| 半年 | 12,672 根 | 3,168 根 | 792 根 | 132 根 |
+| 一年 | 25,344 根 | 6,336 根 | 1,584 根 | 264 根 |
+
+> 指定 `范围` 后忽略 `bars`；两者都不传时默认返回最近 500 根。
+> `get_klines` 默认最多返回 500 根，防止数据量过大。如需更多数据，请使用 `限制` 参数。
 
 ---
 
@@ -71,7 +103,7 @@ uv run gold-mcp                          # 启动 MCP 服务
 
 ---
 
-## 特征工程（42 维）
+## 特征工程（65 维）
 
 | 类别 | 特征 |
 |---|---|
@@ -83,6 +115,12 @@ uv run gold-mcp                          # 启动 MCP 服务
 | 成交量 | `vol_ratio_24`、`vol_chg`（仅在 tick_volume 可用时） |
 | 状态指纹 | `autocorr_24`（24 根收益一阶自相关） |
 | 时段特征 | `hour_sin/cos`、`dow_sin/cos` |
+| 支撑阻力 | `dist_to_high/low_10/20/50`、`range_position_10/20/50` |
+| 斐波那契 | `fib_236/382/500/618`（基于近 50 根高低点） |
+| 趋势强度 | `adx_plus/minus/diff`（简化版 ADX） |
+| 动量加速度 | `mom_accel_12/24` |
+| 波动率比率 | `vol_ratio_12_168`、`vol_ratio_24_72` |
+| K 线动量 | `body_mom_3/6`、`wick_ratio` |
 
 ---
 
@@ -95,7 +133,14 @@ E:\Documents\PythonProjects\gold-lgbm-mt5\
 ├── src/gold_model/
 │   ├── config.py             # 周期/阈值/路径配置
 │   ├── mt5_client.py         # MT5 报价 + K 线；终端离线时回退合成数据
-│   ├── features.py           # 42 维特征 + 二分类/三分类标签
+│   ├── features.py           # 65 维特征 + 二分类/三分类标签
+│   ├── news.py               # 财经日历/快讯抓取 + 非农/CPI 事件影响分析
+│   ├── yahoo_finance.py      # Yahoo Finance 宏观数据（GLD/UUP/VIX/美债等）
+│   ├── cftc.py               # CFTC 黄金持仓报告（每周五更新）
+│   ├── fred.py               # FRED 美债实际收益率/通胀预期（需 API key）
+│   ├── gld_holdings.py       # SPDR GLD 黄金 ETF 持仓量
+│   ├── fedwatch.py           # CME FedWatch 利率概率
+│   ├── daily_briefing.py     # 每日黄金早报生成器
 │   ├── train.py              # Optuna + LightGBM 训练管线（支持二/三分类）
 │   └── serve_mcp.py          # HTTP MCP 服务（中文输出）
 ├── models/
@@ -113,3 +158,50 @@ E:\Documents\PythonProjects\gold-lgbm-mt5\
 - MT5 终端必须已安装并登录，否则服务自动回退到确定性合成数据（`来源` 字段会标明），模型预测会与合成数据相吻合，但不构成实盘可用信号
 - 模型预测的是**条件概率**，不构成投资建议；实盘前需自行做含点差/滑光/手续费的策略级回测
 - `predict` 工具在 `_load_model` 失败时返回明确错误指引，请按提示先训练模型
+- 金十/FX678 的免费 API 不稳定，建议申请金十开放平台 API key（https://open.jin10.com/）以获得稳定数据
+- 非农/CPI 等数据公布时间基于美国夏令时（3月-11月），冬令时（11月-3月）会推迟 1 小时
+
+## 财经资讯接入
+
+### 配置金十 API（推荐）
+
+1. 访问 https://open.jin10.com/ 注册并申请 API key
+2. 编辑 `src/gold_model/news.py`，设置 `JIN10_API_KEY = "你的key"`
+3. 重启 MCP 服务
+
+### 配置 FRED API（推荐）
+
+1. 访问 https://fred.stlouisfed.org/docs/api/api_key.html 免费申请 API key
+2. 编辑 `src/gold_model/fred.py`，设置 `FRED_API_KEY = "你的key"`
+3. 重启 MCP 服务
+
+### 无 API 时的备用方案
+
+- 系统会自动尝试网页抓取（可能不稳定）
+- 所有事件影响分析基于内置规则，不依赖外部数据
+- 支持手动输入事件进行分析：`analyze_event("美国非农就业报告")`
+
+### 支持的事件类型
+
+| 事件类型 | 重要性 | 对黄金影响 |
+|---------|--------|-----------|
+| 非农 | 极高 | 数据好→美元强→黄金跌；数据差→美元弱→黄金涨 |
+| CPI | 极高 | CPI 高→通胀→加息预期→黄金跌；CPI 低→降息预期→黄金涨 |
+| 美联储 | 极高 | 加息/鹰派→黄金跌；降息/鸽派→黄金涨 |
+| GDP | 高 | GDP 强→风险偏好→黄金跌；GDP 弱→避险→黄金涨 |
+| PCE | 高 | 美联储最关注的通胀指标，影响同 CPI |
+| 失业率 | 高 | 失业率升→经济弱→黄金涨；失业率降→经济强→黄金跌 |
+| 初请失业金 | 中 | 每周数据，反映就业市场短期变化 |
+| ADP | 中 | 小非农，非农的前瞻指标 |
+| 零售销售 | 中 | 反映消费状况 |
+| ISM | 中 | 制造业景气度先行指标 |
+| 黄金储备 | 高 | 央行购金→长期利好黄金 |
+
+### 定时任务示例
+
+```python
+# 每天早上 8 点生成黄金早报
+from gold_model.news import get_daily_briefing
+briefing = get_daily_briefing()
+# 包含：今日事件、未来3天事件、模型预测、K线摘要、市场状态
+```

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+
+# 模型与数据（体积大，不入库）
+models/*.pkl
+models/*.bak.*
+data/
+*.parquet
+
+# 日志与临时文件
+*.log
+h*.txt
+headers.txt
+mcp_server.log
+
+# IDE
+.idea/
+.vscode/
+.ai-memory/
+
+# 测试缓存
+.pytest_cache/
+.ruff_cache/

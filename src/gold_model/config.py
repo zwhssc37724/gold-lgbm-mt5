@@ -17,9 +17,14 @@ BARS = 50_000               # 拉取的 H1 K 线根数（受 MT5 终端历史限
 BREAKOUT_HORIZON = 1
 BREAKOUT_LOOKBACK = 100
 
-# 方向三分类：未来 24 根（约 1 个交易日）收益率，按 ±0.3% 阈值划分
+# 方向三分类：未来 24 根（约 1 个交易日）收益率划分
 DIRECTION3_HORIZON = 24
-DIRECTION3_THRESHOLD = 0.003  # 0.3%
+DIRECTION3_THRESHOLD = 0.003  # 0.3%（固定阈值的回退值）
+ADAPTIVE_THRESHOLD_ATR_MULT = 1.0  # 自适应阈值 = 近24根 ATR% 中位数 × 该系数
+
+# 训练数据快照与清洗
+DATA_SNAPSHOT = DATA_DIR / "xauusd_h1_snapshot.parquet"
+DENSE_HISTORY = True  # 训练前过滤伪装成 H1 的日线历史
 
 # Optuna / LightGBM
 N_TRIALS = 60

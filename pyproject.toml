@@ -12,11 +12,16 @@ dependencies = [
     "MetaTrader5>=5.0.45; sys_platform == 'win32'",
     "mcp>=1.2.0",
     "joblib>=1.4.0",
+    "requests>=2.31.0",
+    "yfinance>=0.2.40",
+    "pyarrow>=25.0.1",
 ]
 
 [project.scripts]
 gold-train = "gold_model.train:main"
 gold-mcp = "gold_model.serve_mcp:main"
+gold-backtest = "gold_model.backtest:main"
+gold-accuracy = "gold_model.accuracy_check:main"
 
 [build-system]
 requires = ["hatchling"]

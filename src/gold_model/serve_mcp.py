@@ -8,20 +8,27 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from functools import lru_cache
+import math
+import threading
+from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
 from mcp.server.mcpserver import MCPServer
 
-from gold_model import config, mt5_client
+from gold_model import cftc, config, fedwatch, fred, gld_holdings, mt5_client, news, yahoo_finance
 from gold_model.features import DIRECTION3_NAMES_CN, build_features
 
 logger = logging.getLogger("gold_model.mcp")
 
 mcp = MCPServer("gold-trading-model")
+
+# 预测台账：每次预测追加一行 JSONL，供周度对账（accuracy_check）回看命中率
+PREDICTION_LEDGER = config.DATA_DIR / "prediction_ledger.jsonl"
+_LEDGER_LOCK = threading.Lock()
 
 # 输出标签中英文映射
 BREAKOUT_SIGNAL_CN = {
@@ -34,70 +41,291 @@ DIRECTION3_SIGNAL_CN = {
     1: "观望（不操作）",
     2: "看多（开多仓）",
 }
+KLINE_FIELD_CN = {
+    "time": "时间",
+    "open": "开盘价",
+    "high": "最高价",
+    "low": "最低价",
+    "close": "收盘价",
+    "tick_volume": "成交量",
+    "spread": "点差",
+}
+
+# 时间范围 → 交易日数（现货黄金每周约 5 个交易日，每月约 22 个交易日）
+RANGE_TRADING_DAYS = {
+    "一天": 1,
+    "一周": 5,
+    "一个月": 22,
+    "三个月": 66,
+    "半年": 132,
+    "一年": 264,
+}
 
 
-@lru_cache(maxsize=4)
+def _bars_for_range(timeframe: str, 时间范围: str) -> int:
+    """按时间范围与 K 线周期换算需要拉取的 K 线根数。"""
+    days = RANGE_TRADING_DAYS[时间范围]
+    minutes = mt5_client.TIMEFRAMES.get(timeframe, ("H1", 60))[1]
+    return int(max(10, min(math.ceil(days * 1440 / minutes), config.BARS)))
+
+
+_MODEL_CACHE: dict[str, tuple[float, object]] = {}
+
+
 def _load_model(path_key: str):
-    """惰性加载模型，结果缓存。path_key: 'breakout' 或 'direction3'。"""
+    """加载模型并按文件 mtime 自动失效（重新训练后无需重启服务）。"""
     path = config.BREAKOUT_MODEL_PATH if path_key == "breakout" else config.DIRECTION3_MODEL_PATH
     if not path.exists():
         raise FileNotFoundError(
             f"模型未找到：{path}。请先运行 `uv run gold-train --target {path_key}`"
         )
-    return joblib.load(path)
+    mtime = path.stat().st_mtime
+    cached = _MODEL_CACHE.get(path_key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    bundle = joblib.load(path)
+    _MODEL_CACHE[path_key] = (mtime, bundle)
+    logger.info("model loaded (%s, mtime=%.0f)", path_key, mtime)
+    return bundle
 
 
 def _build_input_row(symbol: str, timeframe: str, bundle: dict) -> pd.DataFrame:
     needed = 300  # 滚动特征需要的历史长度
     df = mt5_client.get_klines(symbol=symbol, timeframe=timeframe, bars=needed)
+    if mt5_client.is_synthetic(df):
+        raise RuntimeError(
+            "MT5 数据不可用，当前为合成数据——拒绝预测。请检查 MT5 终端连接后再试。"
+        )
     X = build_features(df)
     feats = [c for c in bundle["features"] if c in X.columns]
     row = X[feats].iloc[-1:].astype(float).replace([np.inf, -np.inf], 0.0).fillna(0.0)
     return row, df
 
 
+def _record_prediction(kind: str, result: dict) -> None:
+    """把一次预测追加写入 JSONL 台账（失败不影响返回）。"""
+    try:
+        rec = {
+            "ts": pd.Timestamp.now(tz="UTC").isoformat(),
+            "kind": kind,
+            "signal": result.get("信号"),
+            "price": result.get("最新收盘价"),
+            "kline_time": result.get("K线时间"),
+        }
+        if kind == "breakout":
+            rec["probability"] = result.get("扩张概率")
+        else:
+            rec["prob_short"] = result.get("看空概率")
+            rec["prob_flat"] = result.get("观望概率")
+            rec["prob_long"] = result.get("看多概率")
+            rec["pred_class"] = result.get("预测类别")
+        with _LEDGER_LOCK:
+            PREDICTION_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+            with PREDICTION_LEDGER.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as exc:  # pragma: no cover - ledger must never break predictions
+        logger.warning("failed to record prediction: %s", exc)
+
+
+def _add_market_status(result: dict) -> dict:
+    """给结果添加市场状态字段。"""
+    result["市场状态"] = mt5_client.is_market_open()
+    return result
+
+
+def _add_risk_fields(
+    result: dict,
+    current_price: float,
+    atr: float,
+    direction: str = "neutral",
+) -> dict:
+    """给预测结果添加风险管理字段。
+
+    参数：
+      - current_price: 当前价格
+      - atr: 平均真实波幅（用于计算止损）
+      - direction: "long" / "short" / "neutral"
+    """
+    # 基于 ATR 的止损建议
+    if direction == "long":
+        stop_loss = current_price - atr * 2
+        take_profit_1 = current_price + atr * 2  # 1:1
+        take_profit_2 = current_price + atr * 4  # 2:1
+    elif direction == "short":
+        stop_loss = current_price + atr * 2
+        take_profit_1 = current_price - atr * 2
+        take_profit_2 = current_price - atr * 4
+    else:
+        stop_loss = current_price - atr * 2
+        take_profit_1 = current_price + atr * 2
+        take_profit_2 = current_price + atr * 4
+
+    risk_reward_1 = abs(take_profit_1 - current_price) / abs(current_price - stop_loss)
+    risk_reward_2 = abs(take_profit_2 - current_price) / abs(current_price - stop_loss)
+
+    result["风险管理"] = {
+        "当前价格": round(current_price, 2),
+        "ATR（平均波幅）": round(atr, 2),
+        "建议止损": round(stop_loss, 2),
+        "建议止盈1（1:1）": round(take_profit_1, 2),
+        "建议止盈2（2:1）": round(take_profit_2, 2),
+        "风险回报比1": round(risk_reward_1, 2),
+        "风险回报比2": round(risk_reward_2, 2),
+        "建议仓位": "轻仓（≤5%）" if direction != "neutral" else "观望",
+    }
+    return result
+
+
+def _get_atr(df: pd.DataFrame, period: int = 14) -> float:
+    """计算 ATR（平均真实波幅）。"""
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    return float(tr.ewm(alpha=1 / period, adjust=False).mean().iloc[-1])
+
+
+def _get_support_resistance(df: pd.DataFrame, window: int = 20) -> dict:
+    """计算近期支撑阻力位。"""
+    recent = df.tail(window)
+    return {
+        f"近{window}根支撑": round(float(recent["low"].min()), 2),
+        f"近{window}根阻力": round(float(recent["high"].max()), 2),
+        f"近{window}根中轴": round(float((recent["high"].max() + recent["low"].min()) / 2), 2),
+    }
+
+
 @mcp.tool()
 def get_quote(symbol: str = config.SYMBOL) -> dict:
     """获取某品种的 MT5 实时报价（买价/卖价/最新价）。"""
-    return mt5_client.get_quote(symbol)
+    return _add_market_status(mt5_client.get_quote(symbol))
 
 
 @mcp.tool()
-def get_klines(symbol: str = config.SYMBOL, timeframe: str = config.TIMEFRAME, bars: int = 500) -> list[dict]:
+def get_market_status() -> dict:
+    """获取当前市场状态（开市/休市/周末）。"""
+    return mt5_client.is_market_open()
+
+
+@mcp.tool()
+def get_klines(
+    symbol: str = config.SYMBOL,
+    timeframe: str = config.TIMEFRAME,
+    bars: int = 500,
+    范围: str = "",
+    限制: int = 500,
+) -> dict:
     """获取某品种的 MT5 K 线数据（OHLCV）。
 
-    timeframe: M1/M5/M15/M30/H1/H4/D1；bars: 10..50000。
+    参数：
+      - timeframe：K 线周期，M1/M5/M15/M30/H1/H4/D1
+      - bars：直接指定返回的 K 线根数（10..50000）
+      - 范围：按时间范围获取，可选 一天/一周/一个月/三个月/半年/一年。
+        指定后忽略 bars，自动按周期换算 K 线根数
+        （一周 = 近 5 个交易日；例如 H1 一周 ≈ 120 根，M15 一周 ≈ 480 根）。
+      - 限制：最多返回的 K 线根数（默认 500，防止数据量过大）。
+        如需完整数据，请分批次调用或使用更大的限制值。
+
+    范围 与 bars 都不传时，默认返回最近 500 根。
     """
+    if 范围:
+        if 范围 not in RANGE_TRADING_DAYS:
+            raise ValueError(f"不支持的范围「{范围}」，可选：{'、'.join(RANGE_TRADING_DAYS)}")
+        bars = _bars_for_range(timeframe, 范围)
     df = mt5_client.get_klines(symbol=symbol, timeframe=timeframe, bars=bars)
-    return _json_records(df)
+
+    # 限制返回数量，防止 token 爆炸
+    total = len(df)
+    if total > 限制:
+        df = df.tail(限制)
+        truncated = True
+    else:
+        truncated = False
+
+    records = _json_records(df)
+    return {
+        "数据": records,
+        "统计": {
+            "总根数": total,
+            "返回根数": len(records),
+            "是否截断": truncated,
+            "最新时间": records[-1]["时间"] if records else None,
+            "最旧时间": records[0]["时间"] if records else None,
+        },
+        "市场状态": mt5_client.is_market_open(),
+    }
+
+
+@mcp.tool()
+def get_klines_summary(symbol: str = config.SYMBOL, timeframe: str = config.TIMEFRAME) -> dict:
+    """获取 K 线数据摘要（不返回原始数据，只返回统计信息）。
+
+    适合快速了解市场状态而不消耗大量 token。
+    """
+    df = mt5_client.get_klines(symbol=symbol, timeframe=timeframe, bars=100)
+    if df.empty:
+        return {"错误": "无数据"}
+
+    latest = df.iloc[-1]
+    prev_24 = df.tail(24)
+
+    return {
+        "品种": symbol,
+        "周期": timeframe,
+        "最新价格": round(float(latest["close"]), 2),
+        "最新时间": latest["time"].isoformat(),
+        "24小时最高": round(float(prev_24["high"].max()), 2),
+        "24小时最低": round(float(prev_24["low"].min()), 2),
+        "24小时涨跌": round(float((latest["close"] / prev_24.iloc[0]["open"] - 1) * 100), 2),
+        "24小时成交量": int(prev_24["tick_volume"].sum()),
+        "ATR14": round(_get_atr(df), 2),
+        "支撑阻力": _get_support_resistance(df),
+        "市场状态": mt5_client.is_market_open(),
+    }
 
 
 @mcp.tool()
 def predict(symbol: str = config.SYMBOL, timeframe: str = config.TIMEFRAME) -> dict:
-    """波动扩张预测（二分类）：下一根 K 线振幅是否突破近 100 根中位数。
+    """波动扩张预测（二分类）：预测下一根 K 线振幅是否突破近 100 根中位数。
 
-    返回字段：
-      - 目标：固定为 "breakout"（波动扩张）
+    返回字段（全部中文）：
+      - 品种、周期
+      - 目标：波动扩张
       - 扩张概率：模型输出 0~1
       - 信号：预期扩张 / 预期收敛 / 中性
-      - 最新价、报价、时间、模型
+      - 最新收盘价、实时报价、K线时间、模型
+      - 风险管理：止损、止盈、风险回报比、建议仓位
+      - 市场状态
     """
     bundle = _load_model("breakout")
     row, df = _build_input_row(symbol, timeframe, bundle)
     proba = float(bundle["model"].predict(row)[0])
     raw_signal = "EXPECT_EXPANSION" if proba >= 0.6 else "EXPECT_COMPRESSION" if proba <= 0.4 else "NEUTRAL"
     quote = mt5_client.get_quote(symbol)
-    return {
+    current_price = float(df["close"].iloc[-1])
+    atr = _get_atr(df)
+
+    result = {
         "品种": symbol,
         "周期": timeframe,
-        "目标": "波动扩张（breakout）",
+        "目标": "波动扩张",
         "扩张概率": round(proba, 4),
         "信号": BREAKOUT_SIGNAL_CN[raw_signal],
-        "最新收盘价": round(float(df["close"].iloc[-1]), 2),
+        "最新收盘价": round(current_price, 2),
         "实时报价": quote,
         "K线时间": str(df["time"].iloc[-1]),
         "模型": "LightGBM + Optuna（二分类）",
+        "支撑阻力": _get_support_resistance(df),
     }
+
+    _add_risk_fields(result, current_price, atr, direction="neutral")
+    _add_market_status(result)
+    _record_prediction("breakout", result)
+    return result
 
 
 @mcp.tool()
@@ -113,6 +341,9 @@ def predict_direction_3class(symbol: str = config.SYMBOL, timeframe: str = confi
       - 看空概率、观望概率、看多概率（三类概率分布）
       - 信号：概率最大的类别（带仓位建议）
       - 预测类别、看多减看空置信度、最新收盘价、实时报价、K线时间、模型
+      - 风险管理：止损、止盈、风险回报比、建议仓位
+      - 支撑阻力位
+      - 市场状态
     """
     bundle = _load_model("direction3")
     row, df = _build_input_row(symbol, timeframe, bundle)
@@ -121,7 +352,14 @@ def predict_direction_3class(symbol: str = config.SYMBOL, timeframe: str = confi
     pred_class = int(np.argmax(proba_vec))
     quote = mt5_client.get_quote(symbol)
     confidence_long_short = float(proba_vec[2] - proba_vec[0])  # 看多减看空
-    return {
+    current_price = float(df["close"].iloc[-1])
+    atr = _get_atr(df)
+
+    # 确定方向用于风控计算
+    direction_map = {0: "short", 1: "neutral", 2: "long"}
+    direction = direction_map[pred_class]
+
+    result = {
         "品种": symbol,
         "周期": timeframe,
         "目标": "方向三分类（看空/观望/看多）",
@@ -131,13 +369,19 @@ def predict_direction_3class(symbol: str = config.SYMBOL, timeframe: str = confi
         "信号": DIRECTION3_SIGNAL_CN[pred_class],
         "预测类别": DIRECTION3_NAMES_CN[pred_class],
         "看多减看空置信度": round(confidence_long_short, 4),
-        "最新收盘价": round(float(df["close"].iloc[-1]), 2),
+        "最新收盘价": round(current_price, 2),
         "实时报价": quote,
         "K线时间": str(df["time"].iloc[-1]),
         "模型": "LightGBM + Optuna（三分类）",
         "预测周期": f"未来 {bundle.get('horizon', 24)} 根 K 线（{bundle.get('horizon', 24) * 60} 分钟）",
         "分类阈值": f"±{bundle.get('threshold', 0.003) * 100:.2f}%",
+        "支撑阻力": _get_support_resistance(df),
     }
+
+    _add_risk_fields(result, current_price, atr, direction=direction)
+    _add_market_status(result)
+    _record_prediction("direction3", result)
+    return result
 
 
 def _json_records(df: pd.DataFrame) -> list[dict]:
@@ -150,7 +394,213 @@ def _json_records(df: pd.DataFrame) -> list[dict]:
             return v.isoformat()
         return v
 
-    return [{k: _clean(v) for k, v in rec.items()} for rec in df.to_dict("records")]
+    return [{KLINE_FIELD_CN.get(k, k): _clean(v) for k, v in rec.items()} for rec in df.to_dict("records")]
+
+
+# ---------------------------------------------------------------------------
+# 财经资讯工具
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_today_events() -> dict:
+    """获取今天的重要财经事件（非农、CPI、美联储等）。
+
+    返回今天的重要事件列表，每个事件附带对黄金的影响分析和交易建议。
+    """
+    events = news.get_today_important_events()
+    return {
+        "日期": pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d"),
+        "事件数量": len(events),
+        "事件列表": events,
+        "市场状态": mt5_client.is_market_open(),
+    }
+
+
+@mcp.tool()
+def get_upcoming_events(days: int = 3) -> dict:
+    """获取未来几天的重要财经事件。
+
+    参数：
+      - days: 未来几天（默认 3 天）
+
+    返回：未来几天的重要事件列表，每个事件附带影响分析。
+    """
+    events = news.get_upcoming_events(days)
+    return {
+        "查询范围": f"未来 {days} 天",
+        "事件数量": len(events),
+        "事件列表": events,
+        "市场状态": mt5_client.is_market_open(),
+    }
+
+
+@mcp.tool()
+def get_flash_news(limit: int = 10) -> dict:
+    """获取最新金十快讯。
+
+    参数：
+      - limit: 返回条数（默认 10 条）
+
+    返回：最新快讯列表。
+    """
+    flash_list = news.fetch_jin10_flash(limit)
+    return {
+        "数量": len(flash_list),
+        "快讯": flash_list,
+        "市场状态": mt5_client.is_market_open(),
+    }
+
+
+@mcp.tool()
+def analyze_event(title: str, country: str = "美国") -> dict:
+    """分析特定财经事件对黄金的影响。
+
+    参数：
+      - title: 事件名称，如 "美国非农就业报告"、"美国CPI"
+      - country: 国家/地区
+
+    返回：事件影响分析，包括影响逻辑和交易建议。
+    """
+    event = news.create_manual_event(title=title, country=country, time="")
+    impact = news.analyze_event_impact(event)
+    return {
+        "事件": title,
+        "国家": country,
+        "事件类型": impact["事件类型"],
+        "重要性": impact["重要性"],
+        "影响分析": impact,
+        "市场状态": mt5_client.is_market_open(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 宏观数据工具
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_macro_data() -> dict:
+    """获取黄金相关的宏观数据汇总。
+
+    返回：
+      - 美元指数（UUP）
+      - 美债 10 年收益率
+      - VIX 恐慌指数
+      - 金银比
+      - 金油比
+      - 黄金情绪分析
+    """
+    macro = yahoo_finance.get_macro_indicators()
+    sentiment = yahoo_finance.get_gold_sentiment()
+
+    return {
+        "宏观数据": macro,
+        "黄金情绪": sentiment,
+        "市场状态": mt5_client.is_market_open(),
+    }
+
+
+@mcp.tool()
+def get_cftc_position() -> dict:
+    """获取 CFTC 黄金持仓报告。
+
+    CFTC 每周五公布对冲基金等大投机者的黄金期货持仓，
+    是判断黄金中长期趋势的重要领先指标。
+
+    返回：
+      - 报告日期
+      - 非商业净多头（关键指标）
+      - 净多头变化
+      - 情绪判断
+    """
+    return cftc.get_cftc_summary()
+
+
+@mcp.tool()
+def get_real_yield() -> dict:
+    """获取美债实际收益率（TIPS）。
+
+    实际收益率是黄金的"定价锚"——实际收益率涨则黄金跌，反之亦然。
+    相关性约 -0.8，是判断黄金中长期走势的最重要指标。
+
+    返回：
+      - 实际收益率
+      - 通胀预期
+      - 名义收益率
+      - 分析
+    """
+    return fred.get_gold_pricing_model()
+
+
+@mcp.tool()
+def get_gld_holdings() -> dict:
+    """获取 SPDR GLD 黄金 ETF 持仓量。
+
+    GLD 是全球最大黄金 ETF，持仓量变化反映机构资金对黄金的态度。
+
+    返回：
+      - 持仓量（吨）
+      - 持仓量（盎司）
+      - 日期
+      - 数据来源
+    """
+    return gld_holdings.get_gld_summary()
+
+
+@mcp.tool()
+def get_fedwatch() -> dict:
+    """获取 CME FedWatch 利率概率。
+
+    显示市场对美联储未来利率决定的概率预期。
+
+    返回：
+      - 当前利率
+      - 市场预期（加息/降息/维持）
+      - 数据来源
+    """
+    # 优先用 FedWatch，失败则用 FRED 备用方案
+    fedwatch_data = fedwatch.get_fedwatch_summary()
+    if fedwatch_data.get("状态") == "数据需手动查看":
+        # 尝试 FRED 备用方案
+        fred_data = fedwatch.get_rate_expectation_from_fred()
+        if fred_data:
+            return fred_data
+
+    return fedwatch_data
+
+
+@mcp.tool()
+def get_comprehensive_analysis() -> dict:
+    """获取黄金综合分析（所有数据源汇总）。
+
+    返回：
+      - MT5 模型预测
+      - Yahoo 宏观数据
+      - CFTC 持仓
+      - 实际收益率
+      - GLD 持仓
+      - 利率预期
+      - 市场状态
+    """
+    # MT5 模型预测
+    mt5_predictions = {}
+    try:
+        from gold_model.serve_mcp import predict, predict_direction_3class
+        mt5_predictions["波动扩张"] = predict()
+        mt5_predictions["方向三分类"] = predict_direction_3class()
+    except Exception as e:
+        mt5_predictions["错误"] = str(e)
+
+    return {
+        "MT5模型预测": mt5_predictions,
+        "宏观数据": yahoo_finance.get_macro_indicators(),
+        "黄金情绪": yahoo_finance.get_gold_sentiment(),
+        "CFTC持仓": cftc.get_cftc_summary(),
+        "实际收益率": fred.get_gold_pricing_model(),
+        "GLD持仓": gld_holdings.get_gld_summary(),
+        "利率预期": fedwatch.get_fedwatch_summary(),
+        "市场状态": mt5_client.is_market_open(),
+        "时间": pd.Timestamp.now(tz="UTC").isoformat(),
+    }
 
 
 def main() -> None:
@@ -166,3 +616,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

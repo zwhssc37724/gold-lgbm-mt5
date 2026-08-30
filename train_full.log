@@ -1,28 +1,33 @@
-2026-08-28 13:41:09,965 INFO klines loaded: 23328 rows (source includes fallback)
-2026-08-28 13:41:10,869 INFO dataset ready: target=breakout, 23128 samples, 42 features, positive rate 0.4952
-2026-08-28 13:41:10,869 INFO train=18502  test=4626 (time-ordered split)
-2026-08-28 14:01:08,365 INFO best CV AUC=0.78826  params={'num_leaves': 93, 'max_depth': 10, 'learning_rate': 0.0225014273785538, 'min_child_samples': 103, 'feature_fraction': 0.559390815741297, 'bagging_fraction': 0.9232548299820843, 'bagging_freq': 1, 'lambda_l1': 1.521080075996593e-07, 'lambda_l2': 8.093230832379012e-06, 'objective': 'binary', 'metric': 'auc', 'verbosity': -1, 'seed': 42}
-2026-08-28 14:01:13,931 INFO TEST AUC = 0.76522  (n=4626, positive rate 0.4974)
-2026-08-28 14:01:13,982 INFO   feat vol_ratio_24     gain=35410.4
-2026-08-28 14:01:13,982 INFO   feat hour_sin         gain=26081.7
-2026-08-28 14:01:13,982 INFO   feat hour_cos         gain=23259.6
-2026-08-28 14:01:13,982 INFO   feat hl_range         gain=13817.1
-2026-08-28 14:01:13,982 INFO   feat vol_chg          gain=10311.9
-2026-08-28 14:01:13,982 INFO   feat vol_168          gain=8942.1
-2026-08-28 14:01:13,982 INFO   feat atr_7            gain=6587.6
-2026-08-28 14:01:13,982 INFO   feat vol_24           gain=5519.5
-2026-08-28 14:01:13,982 INFO   feat kurt_24          gain=5034.1
-2026-08-28 14:01:13,982 INFO   feat mom_168          gain=4972.4
-2026-08-28 14:01:13,983 INFO   feat vol_72           gain=4876.4
-2026-08-28 14:01:13,983 INFO   feat vol_12           gain=4554.1
-2026-08-28 14:01:13,983 INFO   feat ret_2            gain=4083.6
-2026-08-28 14:01:13,983 INFO   feat autocorr_24      gain=4059.7
-2026-08-28 14:01:13,983 INFO   feat ret_1            gain=3850.2
+2026-08-29 09:53:39,942 INFO klines loaded: 23343 rows (source includes fallback)
+2026-08-29 09:53:40,779 INFO dataset ready: target=breakout, 23143 samples, 42 features, 正样本率=0.4952
+2026-08-29 09:53:40,780 INFO train=18514  test=4629 (time-ordered split)
+2026-08-29 10:33:20,978 INFO best CV AUC=0.78861  params={'num_leaves': 37, 'max_depth': 10, 'learning_rate': 0.020842958303060308, 'min_child_samples': 65, 'feature_fraction': 0.6893095430378663, 'bagging_fraction': 0.8090994605267066, 'bagging_freq': 6, 'lambda_l1': 0.2483632144018675, 'lambda_l2': 3.539884087096649e-08, 'objective': 'binary', 'metric': 'auc', 'verbosity': -1, 'seed': 42}
+2026-08-29 10:33:25,024 INFO test metrics: {'测试样本数': 4629, '测试AUC': 0.767632421679419, '测试正样本率': 0.4964}
+2026-08-29 10:33:25,064 INFO   特征 vol_ratio_24     增益=37362.7
+2026-08-29 10:33:25,064 INFO   特征 hour_cos         增益=22808.9
+2026-08-29 10:33:25,064 INFO   特征 hour_sin         增益=21638.1
+2026-08-29 10:33:25,064 INFO   特征 hl_range         增益=12402.4
+2026-08-29 10:33:25,064 INFO   特征 vol_chg          增益=10094.8
+2026-08-29 10:33:25,064 INFO   特征 vol_168          增益=8367.5
+2026-08-29 10:33:25,064 INFO   特征 atr_7            增益=4896.4
+2026-08-29 10:33:25,064 INFO   特征 vol_24           增益=4415.8
+2026-08-29 10:33:25,064 INFO   特征 kurt_24          增益=4317.2
+2026-08-29 10:33:25,064 INFO   特征 vol_72           增益=4297.1
+2026-08-29 10:33:25,064 INFO   特征 mom_168          增益=4202.2
+2026-08-29 10:33:25,065 INFO   特征 vol_12           增益=4099.5
+2026-08-29 10:33:25,065 INFO   特征 autocorr_24      增益=3346.5
+2026-08-29 10:33:25,065 INFO   特征 rsi_14           增益=3316.9
+2026-08-29 10:33:25,065 INFO   特征 skew_24          增益=2987.0
 {
-  "target": "breakout",
-  "test_auc": 0.7652240961152935,
-  "cv_auc": 0.7882600236890438,
-  "n_test": 4626
+  "目标": "breakout",
+  "最佳CV": {
+    "auc": 0.7886133040139814
+  },
+  "测试集指标": {
+    "测试样本数": 4629,
+    "测试AUC": 0.767632421679419,
+    "测试正样本率": 0.4964
+  },
+  "模型路径": "E:\\Documents\\PythonProjects\\gold-lgbm-mt5\\models\\gold_lgbm_breakout.pkl"
 }
-model saved -> C:\Users\Administrator\WorkBuddy\2026-08-28-13-11-29\gold-lgbm-mt5\models\gold_lgbm.pkl
-EXIT=0
+模型已保存 -> E:\Documents\PythonProjects\gold-lgbm-mt5\models\gold_lgbm_breakout.pkl
