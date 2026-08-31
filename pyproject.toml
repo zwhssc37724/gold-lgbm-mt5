@@ -1,7 +1,7 @@
 [project]
 name = "gold-lgbm-mt5"
 version = "0.2.0"
-description = "LightGBM gold (XAUUSD) trading model with Optuna tuning and MT5 data feed — inference via external gold-trading MCP"
+description = "LightGBM gold (XAUUSD) trading model with Optuna tuning, MT5 data feed and HTTP MCP server (news/macro tools delegated to external jin10/Alpha Vantage MCPs)"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "lightgbm>=4.5.0",
@@ -10,13 +10,16 @@ dependencies = [
     "numpy>=1.26.0",
     "scikit-learn>=1.5.0",
     "MetaTrader5>=5.0.45; sys_platform == 'win32'",
+    "mcp>=1.2.0",
     "joblib>=1.4.0",
+    "requests>=2.31.0",
     "yfinance>=0.2.40",
     "pyarrow>=25.0.1",
 ]
 
 [project.scripts]
 gold-train = "gold_model.train:main"
+gold-mcp = "gold_model.serve_mcp:main"
 gold-backtest = "gold_model.backtest:main"
 gold-accuracy = "gold_model.accuracy_check:main"
 gold-drift = "gold_model.drift:main"
@@ -40,9 +43,15 @@ target-version = "py312"
 [tool.ruff.lint.per-file-ignores]
 # MT5 terminal interactions intentionally degrade gracefully on any failure.
 "src/gold_model/mt5_client.py" = ["BLE001", "S110"]
+# Web scraping modules (cftc/gld): every fetch degrades gracefully to
+# cache/None on any network failure by design.
+"src/gold_model/cftc.py" = ["BLE001"]
+"src/gold_model/gld_holdings.py" = ["BLE001"]
 # Macro fetch: degrade to zero-filled features when network fails (documented).
 "src/gold_model/macro_features.py" = ["BLE001"]
 # Ledger writes must never break predictions.
 "src/gold_model/ledger.py" = ["BLE001"]
+# MCP server: tool calls must degrade gracefully; ledger writes never break predictions.
+"src/gold_model/serve_mcp.py" = ["BLE001"]
 # Training pipeline tolerates optional components (calibration/drift) failing.
 "src/gold_model/train.py" = ["BLE001"]

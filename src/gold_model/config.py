@@ -1,7 +1,4 @@
-"""全局配置 —— 仅保留训练/评估管线所需配置。
-
-MCP 服务端配置已移除——实时报价、预测、宏观数据等由外部 gold-trading MCP 提供。
-"""
+"""全局配置：训练/评估管线 + MCP 服务端。"""
 
 from pathlib import Path
 
@@ -37,6 +34,11 @@ DENSE_HISTORY = True  # 训练前过滤伪装成 H1 的日线历史
 N_TRIALS = 60
 RANDOM_STATE = 42
 EARLY_STOPPING_ROUNDS = 100
+
+# MCP 服务（gold-trading MCP 后端）
+MCP_HOST = "127.0.0.1"
+MCP_PORT = 8000
+MCP_PATH = "/mcp"
 
 # 模型文件
 BREAKOUT_MODEL_PATH = MODEL_DIR / "gold_lgbm_breakout.pkl"
