@@ -62,7 +62,12 @@ def fetch_macro_series(
     """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_key = f"{symbol}|{start}|{cache_buster}"
-    cp = CACHE_DIR / f"{_cache_path(symbol).stem}_{abs(hash(cache_key)) & 0xFFFFFF:06x}.parquet"
+    # 稳定哈希：不能用内置 hash()（进程间随机化，缓存重启必然失效，
+    # 曾堆积 112 个孤儿 parquet）
+    import hashlib
+
+    digest = hashlib.md5(cache_key.encode()).hexdigest()[:6]
+    cp = CACHE_DIR / f"{_cache_path(symbol).stem}_{digest}.parquet"
     if cp.exists():
         age_h = (pd.Timestamp.now(tz="UTC") - pd.Timestamp(cp.stat().st_mtime, unit="s", tz="UTC")).total_seconds() / 3600
         if age_h < CACHE_TTL_HOURS:
@@ -147,23 +152,3 @@ def build_macro_features(kline_index: pd.Series) -> pd.DataFrame:
         for c in cols:
             result[c] = merged[c].fillna(0.0).to_numpy()
     return result
-
-
-def macro_coverage(kline_index: pd.Series) -> dict:
-    """诊断：各宏观序列在给定 H1 时间戳上的真实覆盖率（非填充比例）。"""
-    cov = {}
-    for name, symbol in MACRO_SYMBOLS.items():
-        series = fetch_macro_series(symbol)
-        if series is None or series.empty:
-            cov[name] = 0.0
-            continue
-        t = pd.to_datetime(pd.Series(kline_index))
-        if t.dt.tz is None:
-            t = t.dt.tz_localize("UTC")
-        else:
-            t = t.dt_tz_convert("UTC") if hasattr(t, "dt_tz_convert") else t.dt.tz_convert("UTC")
-        # 简化覆盖率：时间戳 >= 序列首日期+1天 且 <= 序列末日期 的比例
-        lo = series.index[0] + pd.Timedelta(days=1)
-        hi = series.index[-1]
-        cov[name] = float(((t >= lo) & (t <= hi)).mean())
-    return cov

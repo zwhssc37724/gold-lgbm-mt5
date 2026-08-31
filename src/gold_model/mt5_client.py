@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import numpy as np
@@ -70,12 +69,6 @@ def _mt5():
             return None
     _MT5 = mt5
     return mt5
-
-
-def mt5_available() -> bool:
-    """Cheap health check under the lock."""
-    with _MT5_LOCK:
-        return _mt5() is not None
 
 
 def _mark(df: pd.DataFrame, source: str) -> pd.DataFrame:
@@ -136,15 +129,6 @@ def filter_dense_history(df: pd.DataFrame, timeframe: str = config.TIMEFRAME) ->
 # ---------------------------------------------------------------------------
 # Market status
 # ---------------------------------------------------------------------------
-
-@dataclass
-class Quote:
-    symbol: str
-    bid: float
-    ask: float
-    last: float
-    time: str  # ISO format, broker/server time
-
 
 def _tf_to_mt5(timeframe: str):
     mt5 = _mt5()
