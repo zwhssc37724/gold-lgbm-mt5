@@ -49,7 +49,9 @@ target-version = "py312"
 "src/gold_model/cftc.py" = ["BLE001"]
 "src/gold_model/gld_holdings.py" = ["BLE001"]
 # Trade history: MT5 calls degrade gracefully with clear error dict.
-"src/gold_model/trade_history.py" = ["BLE001"]
+# DTZ005: naive datetimes are intentional — the MT5 API interprets them in
+# the terminal-server timezone; passing tz-aware values breaks the query window.
+"src/gold_model/trade_history.py" = ["BLE001", "DTZ005"]
 # Macro fetch: degrade to zero-filled features when network fails (documented).
 "src/gold_model/macro_features.py" = ["BLE001"]
 # Ledger writes must never break predictions.
