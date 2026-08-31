@@ -1,10 +1,10 @@
-# 黄金交易模型（MT5 + Optuna + LightGBM）
+# 黄金交易模型（MT5 + Optuna + LightGBM + HTTP MCP）
 
-基于本机 MetaTrader 5 终端的 XAUUSD（黄金）交易模型训练/评估管线，Python 3.12 + uv 工程，
-LightGBM + Optuna（TPE）调参。
+基于本机 MetaTrader 5 终端的 XAUUSD（黄金）交易模型，Python 3.12 + uv 工程，LightGBM + Optuna（TPE）调参，通过 streamable-http MCP 对外提供**报价、K 线、波动扩张预测、方向三分类预测、CFTC 持仓、GLD 持仓、漂移检查**等独家能力。
 
-> **实时预测与宏观数据**：由外部 `gold-trading` MCP 服务器提供（Hermes 内置），
-> 本项目仅负责**训练、回测、漂移监控、对账**。重构于 2026-08-31。
+> **2026-08-31 重构**：财经资讯/宏观数据类工具已剥离，统一使用外部 MCP——
+> 快讯/日历 → `jin10` MCP；美债收益率/利率 → `Alpha Vantage` MCP；跨资产行情 → `Alpha Vantage`/`Massive` MCP。
+> 本项目 MCP 只保留**独家能力**（MT5 实盘数据 + 自训模型 + CFTC/GLD 抓取）。
 
 ---
 
@@ -16,18 +16,10 @@ uv sync                                  # 首次：创建 .venv 并安装依赖
 uv run gold-train --target breakout      # 训练波动扩张模型（二分类）
 uv run gold-train --target direction3    # 训练方向三分类模型
 uv run gold-train --target direction_d1  # 训练日线方向模型
+uv run gold-mcp                          # 启动 MCP 服务
 ```
 
-## 预测能力（由外部 MCP 提供）
-
-| 工具 | 任务 | 含义 |
-|---|---|---|
-| `predict` | 波动扩张（breakout，二分类） | 下一根 K 线振幅是否突破近 100 根中位数 |
-| `predict_direction_3class` | 方向三分类（看空/观望/看多） | 未来 24 根 H1 K 线（约 1 个交易日）的方向 |
-| `predict_direction_d1` | 日线方向三分类（未来 5 个交易日） | D1 尺度方向，作为 H1 高置信信号的过滤器 |
-
-实时报价、K 线、宏观数据（DXY/VIX/美债）、CFTC 持仓、GLD 持仓、FedWatch、
-金十快讯 → 全部由 MCP 工具 `mcp__gold_trading__*` 提供。
+服务启动后监听 `http://127.0.0.1:8000/mcp`，Hermes 的 `gold-trading` MCP 即指向此处。
 
 ---
 
@@ -80,17 +72,20 @@ E:\Documents\PythonProjects\gold-lgbm-mt5\
 ├── PREREGISTRATION.md
 ├── tests/test_pipeline.py     # 单元测试
 ├── src/gold_model/
-│   ├── config.py             # 训练/评估配置
+│   ├── config.py             # 训练/评估/MCP 配置
 │   ├── mt5_client.py         # MT5 报价 + K 线（线程锁/连接复用/密度过滤）
 │   ├── features.py           # 65 维价格特征 + 二分类/三分类标签
 │   ├── macro_features.py     # 宏观特征（DXY/US10Y/VIX/GLD，防泄漏对齐）
 │   ├── ledger.py             # 预测台账（供 accuracy_check 对账）
+│   ├── cftc.py               # CFTC 黄金持仓报告（独家，无外部 MCP 等价）
+│   ├── gld_holdings.py       # SPDR GLD 黄金 ETF 持仓量（独家）
 │   ├── train.py              # Optuna + LightGBM 训练
 │   ├── backtest.py           # 向量化回测器（含随机对照）
 │   ├── walkforward.py        # 共享 walk-forward 评估
 │   ├── calibration.py        # 概率校准（isotonic）
 │   ├── accuracy_check.py     # 预测对账（命中率/校准）
-│   └── drift.py              # 特征漂移监控（PSI）
+│   ├── drift.py              # 特征漂移监控（PSI）
+│   └── serve_mcp.py          # HTTP MCP 服务端（11 个独家工具）
 ├── experiments/              # 实验脚本（D1 门控、H1×D1 交叉过滤等）
 ├── data/
 │   ├── xauusd_h1_snapshot.parquet   # 训练数据快照
