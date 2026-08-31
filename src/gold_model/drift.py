@@ -38,29 +38,64 @@ def reference_path(target: str) -> Path:
     return config.MODEL_DIR / f"drift_reference_{target}.json"
 
 
-def build_reference(X_train: pd.DataFrame, target: str) -> Path:
-    """训练时存参考分位数（每特征 10 个分位点 + 缺失率）。"""
+# 周期性日历特征：相邻窗口相位平移是几何必然，不构成分布漂移，监控排除
+CYCLIC_FEATURES = {"hour_sin", "hour_cos", "dow_sin", "dow_cos"}
+
+
+def build_reference(X_train: pd.DataFrame, target: str, tail: int = 500) -> Path:
+    """训练时存参考分布：分位边界 + 参考自身落箱比例 + 缺失率。
+
+    关键设计（2026-08-31 修复）：
+    1. 参考取**训练尾段**而非全史——市场非平稳，全史参考会让任何近期窗口
+       都报"显著漂移"（实测训练数据自比全史仍有 48/81 超阈），报警器常响。
+       漂移监控语义是「当前市场是否偏离模型最后见过的市场」。
+    2. 落箱比例必须存**真实直方图**而非假设每箱 1/n_bins——宏观特征是日线级，
+       24 根 H1 共享同值，大量并列值使分位分箱无法等分（并列日全部落入同箱），
+       "每箱 10%"的假设对并列值特征恒不成立（实测 PSI=1.2 的假漂移来源）。
+    """
+    X_tail = X_train.tail(tail)
     ref = {}
-    for col in X_train.columns:
-        s = X_train[col].astype(float)
+    for col in X_tail.columns:
+        if col in CYCLIC_FEATURES:
+            continue
+        s = X_tail[col].astype(float).dropna()
+        if len(s) < 50:
+            continue
+        quantiles = np.quantile(s, np.linspace(0, 1, PSI_BINS + 1))
+        bins = np.unique(quantiles)
+        if len(bins) < 3:
+            continue  # 常数特征无法分箱
+        counts = np.histogram(s, bins=bins)[0]
         ref[col] = {
-            "quantiles": [round(float(q), 6) for q in np.quantile(s.dropna(), np.linspace(0, 1, PSI_BINS + 1))],
-            "missing_rate": round(float(s.isna().mean()), 4),
+            # 边界必须存原始浮点（repr 完整精度）：round(x,10) 会把边界推到
+            # 并列值另一侧，参考落箱分布随之改变（实测 42/46/46... → 0/46/69...）
+            "bins": [float(b) for b in bins],
+            "bin_props": [float(c) / len(s) for c in counts],
+            "missing_rate": float(X_tail[col].isna().mean()),
         }
+    ref["_meta"] = {
+        "tail_bars": tail,
+        "n_train_rows": len(X_train),
+        "built_at": pd.Timestamp.now(tz="UTC").isoformat(),
+    }
     path = reference_path(target)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(ref, ensure_ascii=False), encoding="utf-8")
-    logger.info("drift reference saved -> %s (%d features)", path, len(ref))
+    logger.info("drift reference saved -> %s (%d features, tail=%d)", path, len(ref) - 1, tail)
     return path
 
 
-def _psi(expected: np.ndarray, actual: np.ndarray, bins: np.ndarray) -> float:
-    """PSI = Σ (a_i - e_i) * ln(a_i / e_i)，分箱边界来自参考分布。"""
+def _psi_from_ref(spec: dict, actual: np.ndarray) -> float:
+    """PSI = Σ (a_i - e_i) * ln(a_i / e_i)，e 来自参考的真实落箱比例。"""
     eps = 1e-6
-    e_counts = np.histogram(expected, bins=bins)[0].astype(float)
+    bins = np.array(spec["bins"])
+    e = np.array(spec["bin_props"], dtype=float)
+    n_bins = len(bins) - 1
+    if n_bins < 2 or len(e) != n_bins:
+        return 0.0
     a_counts = np.histogram(actual, bins=bins)[0].astype(float)
-    e = e_counts / max(e_counts.sum(), 1) + eps
-    a = a_counts / max(a_counts.sum(), 1) + eps
+    a = a_counts / max(a_counts.sum(), 1)
+    e, a = np.clip(e, eps, None), np.clip(a, eps, None)
     return float(np.sum((a - e) * np.log(a / e)))
 
 
@@ -78,29 +113,28 @@ def check_drift(target: str = "direction3", bars: int = 500) -> dict:
         }
 
     timeframe = "D1" if target == "direction_d1" else config.TIMEFRAME
-    df = mt5_client.get_klines(symbol=config.SYMBOL, timeframe=timeframe, bars=bars)
+    # 滚动特征预热：ma_bias_200/vol_168 需要 200+ 根；D1 一次拉多了也就 4000 根
+    warmup = 300 if timeframe != "D1" else 250
+    df = mt5_client.get_klines(symbol=config.SYMBOL, timeframe=timeframe, bars=bars + warmup)
     if mt5_client.is_synthetic(df):
         return {"错误": "MT5 数据不可用（合成数据），漂移检查需要真实行情。"}
+    df = mt5_client.filter_dense_history(df, timeframe=timeframe)
 
     X_price = build_features(df)
     X_macro = macro_features.build_macro_features(df["time"])
     X = pd.concat([X_price.reset_index(drop=True), X_macro], axis=1)
+    X = X.tail(bars)  # 只取目标窗口（预热行只为让滚动特征有效）
 
     ref = json.loads(path.read_text(encoding="utf-8"))
+    meta = ref.pop("_meta", {})
     rows = []
     for col, spec in ref.items():
-        if col not in X.columns:
+        if col not in X.columns or col in CYCLIC_FEATURES:
             continue
         actual = X[col].astype(float).dropna().to_numpy()
         if len(actual) < 50:
             continue
-        bins = np.array(spec["quantiles"])
-        bins = np.unique(bins)  # 常数特征的分位边界会重复
-        if len(bins) < 3:
-            continue  # 常数特征无法分箱
-        # 参考分布用同样的分箱边界（把参考分位本身当样本点重建直方图）
-        expected = np.linspace(bins[0], bins[-1], 1000)
-        psi = _psi(expected, actual, bins)
+        psi = _psi_from_ref(spec, actual)
         rows.append({"特征": col, "PSI": round(psi, 4)})
 
     if not rows:
@@ -120,6 +154,7 @@ def check_drift(target: str = "direction3", bars: int = 500) -> dict:
     return {
         "目标": target,
         "近期数据": f"{len(df)} 根 {timeframe}（{df['time'].iloc[0]} ~ {df['time'].iloc[-1]}）",
+        "参考窗口": f"训练尾段 {meta.get('tail_bars', '?')} 根（建于 {str(meta.get('built_at', '?'))[:10]}）",
         "结论": verdict,
         "PSI阈值": {"稳定": PSI_STABLE, "漂移": PSI_DRIFT},
         "漂移特征数": {"显著": n_drift, "轻度": n_watch, "总特征": len(rows)},

@@ -310,9 +310,14 @@ class TestDrift:
         base = rng.normal(0, 1, 5000)
         same = rng.normal(0, 1, 5000)
         shifted = rng.normal(1.5, 1, 5000)
-        bins = np.quantile(base, np.linspace(0, 1, 11))
-        psi_same = drift._psi(base, same, bins)
-        psi_shift = drift._psi(base, shifted, bins)
+        q = np.quantile(base, np.linspace(0, 1, 11))
+        bins = np.unique(q)
+        spec = {
+            "bins": [float(b) for b in bins],
+            "bin_props": [float(c) / len(base) for c in np.histogram(base, bins=bins)[0]],
+        }
+        psi_same = drift._psi_from_ref(spec, same)
+        psi_shift = drift._psi_from_ref(spec, shifted)
         assert psi_same < 0.05
         assert psi_shift > 0.25
 
