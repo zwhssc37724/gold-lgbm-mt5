@@ -228,11 +228,13 @@ def get_quote(symbol: str = config.SYMBOL) -> dict:
                     tick_time = pd.Timestamp(tick.time, unit="s", tz="UTC")
                     age_seconds = (pd.Timestamp.now(tz="UTC") - tick_time).total_seconds()
                     data_fresh = age_seconds < 60
+                    # MT5 的 tick.last 对现货黄金恒为 0（无逐笔最新价），不输出，
+                    # 报价语义以买卖双边为准，中间价 = (bid+ask)/2
                     return {
                         "品种": symbol,
                         "买价": float(tick.bid),
                         "卖价": float(tick.ask),
-                        "最新价": float(tick.last),
+                        "中间价": round((float(tick.bid) + float(tick.ask)) / 2, 2),
                         "时间": tick_time.isoformat(),
                         "数据来源": "MT5 实时" if data_fresh else "MT5 延迟",
                         "数据新鲜度": "实时" if data_fresh else f"延迟 {int(age_seconds)} 秒",
@@ -246,7 +248,7 @@ def get_quote(symbol: str = config.SYMBOL) -> dict:
         "品种": symbol,
         "买价": round(px * 0.9999, 2),
         "卖价": round(px * 1.0001, 2),
-        "最新价": round(px, 2),
+        "中间价": round(px, 2),
         "时间": pd.Timestamp.now(tz="UTC").isoformat(),
         "数据来源": "合成数据",
         "数据新鲜度": "合成",

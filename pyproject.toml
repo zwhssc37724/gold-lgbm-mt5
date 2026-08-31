@@ -23,6 +23,7 @@ gold-mcp = "gold_model.serve_mcp:main"
 gold-backtest = "gold_model.backtest:main"
 gold-accuracy = "gold_model.accuracy_check:main"
 gold-drift = "gold_model.drift:main"
+gold-trades = "gold_model.trade_history:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -47,6 +48,8 @@ target-version = "py312"
 # cache/None on any network failure by design.
 "src/gold_model/cftc.py" = ["BLE001"]
 "src/gold_model/gld_holdings.py" = ["BLE001"]
+# Trade history: MT5 calls degrade gracefully with clear error dict.
+"src/gold_model/trade_history.py" = ["BLE001"]
 # Macro fetch: degrade to zero-filled features when network fails (documented).
 "src/gold_model/macro_features.py" = ["BLE001"]
 # Ledger writes must never break predictions.

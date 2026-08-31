@@ -22,6 +22,7 @@ from gold_model import (
     config,
     gld_holdings,
     mt5_client,
+    trade_history,
 )
 from gold_model import drift as drift_mod
 from gold_model.features import DIRECTION3_NAMES_CN, build_features
@@ -570,6 +571,48 @@ def get_gld_holdings() -> dict:
       - 数据来源
     """
     return gld_holdings.get_gld_summary()
+
+
+@mcp.tool()
+def get_trade_history(days: int = 30, period: str = "", symbol: str = "", limit: int = 200) -> dict:
+    """获取 MT5 账户交易记录（成交明细 + 订单，只取数不含分析）。
+
+    参数：
+      - days: 近 N 天（默认 30）
+      - period: 快捷范围「今天/本周/本月」（指定后忽略 days）
+      - symbol: 过滤品种（空 = 全部品种）
+      - limit: 返回明细条数上限（默认 200，防止 token 爆炸）
+
+    返回：
+      - 汇总: 笔数/盈亏/成本/品种分布/盈亏分布
+      - 成交明细: 时间/订单号/品种/类型/开平仓方向/手数/价格/止损止盈/手续费/掉期/盈亏
+      - 订单明细: 下单时间/类型/状态（含已撤销挂单）/成交价
+    """
+    try:
+        deals = trade_history.get_deals(
+            days=days, period=period or None, symbol=symbol or None
+        )
+        orders = trade_history.get_orders(
+            days=days, period=period or None, symbol=symbol or None
+        )
+    except RuntimeError as e:
+        return {"错误": str(e)}
+
+    def _records(df: pd.DataFrame, n: int) -> list[dict]:
+        if df.empty:
+            return []
+        recent = df.tail(n)
+        return [
+            {k: (v.isoformat() if isinstance(v, pd.Timestamp) else v)
+             for k, v in rec.items()}
+            for rec in recent.to_dict("records")
+        ]
+
+    return {
+        "汇总": trade_history.summarize(deals),
+        "成交明细": _records(deals, limit),
+        "订单明细": _records(orders, limit),
+    }
 
 
 @mcp.tool()
