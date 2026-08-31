@@ -21,7 +21,11 @@ _LEDGER_LOCK = threading.Lock()
 
 
 def record_prediction(kind: str, result: dict) -> None:
-    """把一次预测追加写入 JSONL 台账（失败不影响返回）。"""
+    """把一次预测追加写入 JSONL 台账（失败不影响返回）。
+
+    去重：同 (kind, kline_time) 只记一条——哨兵 30 分钟轮询时，
+    同一根 H1 K 线会被预测两次，重复记录会让对账样本虚胖。
+    """
     try:
         rec = {
             "ts": pd.Timestamp.now(tz="UTC").isoformat(),
@@ -30,7 +34,7 @@ def record_prediction(kind: str, result: dict) -> None:
             "price": result.get("最新收盘价"),
             "kline_time": result.get("K线时间"),
         }
-        if kind == "breakout":
+        if kind in ("breakout", "breakout_m15"):
             rec["probability"] = result.get("扩张概率")
         else:
             rec["prob_short"] = result.get("看空概率")
@@ -39,7 +43,18 @@ def record_prediction(kind: str, result: dict) -> None:
             rec["pred_class"] = result.get("预测类别")
         with _LEDGER_LOCK:
             PREDICTION_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+            key = (kind, str(rec.get("kline_time")))
+            if key in _RECENT_KEYS:
+                return  # 同一根 K 线已记录过
+            _RECENT_KEYS.add(key)
+            # 防御性裁剪：避免长跑进程内存缓慢增长
+            if len(_RECENT_KEYS) > 10_000:
+                _RECENT_KEYS.clear()
             with PREDICTION_LEDGER.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as exc:
         logger.warning("failed to record prediction: %s", exc)
+
+
+# 进程内去重（kind, kline_time）——哨兵 30 分钟轮询的防重复
+_RECENT_KEYS: set[tuple[str, str]] = set()

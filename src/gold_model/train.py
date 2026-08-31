@@ -55,19 +55,27 @@ class TargetSpec:
     optuna_direction: str
     model_path: Path
     horizon: int  # 标签前瞻根数（purge 用）
+    timeframe: str = config.TIMEFRAME  # 数据周期
+    snapshot: Path | None = None  # 数据快照路径（None = 用默认 H1 快照）
 
 
 def _spec_for(target: str) -> TargetSpec:
-    if target == "breakout":
+    if target in ("breakout", "breakout_m15"):
+        tf = "M15" if target == "breakout_m15" else config.TIMEFRAME
         return TargetSpec(
-            name="breakout",
+            name=target,
             is_multiclass=False,
             num_class=1,
             objective="binary",
             metric="auc",
             optuna_direction="maximize",
-            model_path=config.BREAKOUT_MODEL_PATH,
+            model_path=(
+                config.BREAKOUT_M15_MODEL_PATH
+                if target == "breakout_m15"
+                else config.BREAKOUT_MODEL_PATH
+            ),
             horizon=config.BREAKOUT_HORIZON,
+            timeframe=tf,
         )
     if target == "direction3":
         return TargetSpec(
@@ -98,10 +106,12 @@ def _spec_for(target: str) -> TargetSpec:
 # 数据集构建（快照 + 清洗 + 宏观特征）
 # ---------------------------------------------------------------------------
 
-def load_raw_bars(bars: int, use_snapshot: bool = False) -> pd.DataFrame:
-    """拉取 H1 K 线：优先复用快照；否则 MT5 拉取→密度过滤→存快照。"""
-    if use_snapshot and config.DATA_SNAPSHOT.exists():
-        df = pd.read_parquet(config.DATA_SNAPSHOT)
+def load_raw_bars(bars: int, use_snapshot: bool = False, timeframe: str = config.TIMEFRAME,
+                  snapshot_path: Path | None = None) -> pd.DataFrame:
+    """拉取 K 线（默认 H1）：优先复用快照；否则 MT5 拉取→密度过滤→存快照。"""
+    snap_path = snapshot_path or config.DATA_SNAPSHOT
+    if use_snapshot and snap_path.exists():
+        df = pd.read_parquet(snap_path)
         if mt5_client.is_market_open()["状态"] != "weekend" and df["time"].iloc[-1] < (
             pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=24)
         ):
@@ -109,14 +119,14 @@ def load_raw_bars(bars: int, use_snapshot: bool = False) -> pd.DataFrame:
         else:
             logger.info("using snapshot: %d bars, %s ~ %s", len(df), df["time"].iloc[0], df["time"].iloc[-1])
             return df
-    df = mt5_client.get_klines(symbol=config.SYMBOL, timeframe=config.TIMEFRAME, bars=bars)
+    df = mt5_client.get_klines(symbol=config.SYMBOL, timeframe=timeframe, bars=bars)
     if mt5_client.is_synthetic(df):
         raise RuntimeError("MT5 不可用且无快照：拒绝用合成数据训练。请先连接 MT5 终端。")
     if config.DENSE_HISTORY:
-        df = mt5_client.filter_dense_history(df, timeframe=config.TIMEFRAME)
+        df = mt5_client.filter_dense_history(df, timeframe=timeframe)
     df = df.reset_index(drop=True)
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(config.DATA_SNAPSHOT)
+    df.to_parquet(snap_path)
     logger.info("snapshot saved: %d bars, %s ~ %s", len(df), df["time"].iloc[0], df["time"].iloc[-1])
     return df
 
@@ -155,7 +165,8 @@ def build_dataset(df: pd.DataFrame, target: str) -> tuple[pd.DataFrame, pd.Serie
     elif target == "direction_d1":
         y = build_labels_3class(df, horizon=config.DIRECTION_D1_HORIZON, threshold=0)
     else:
-        y = build_labels(df, horizon=config.BREAKOUT_HORIZON, target=target)
+        # breakout / breakout_m15：下一根相对振幅是否突破近 100 根中位数
+        y = build_labels(df, horizon=config.BREAKOUT_HORIZON, target="breakout")
 
     mask = X.notna().all(axis=1) & y.notna()
     X, y = X[mask].reset_index(drop=True), y[mask].reset_index(drop=True)
@@ -363,6 +374,10 @@ def train(bars: int, trials: int, target: str, use_snapshot: bool = False) -> di
     spec = _spec_for(target)
     if target == "direction_d1":
         df = load_raw_bars_d1(bars=6000, use_snapshot=use_snapshot)
+    elif target == "breakout_m15":
+        # M15 数据量是 H1 的 4 倍，50000 根 ≈ 2 年；取 1/3 控制训练时长
+        df = load_raw_bars(bars=min(bars, 25000), use_snapshot=use_snapshot,
+                           timeframe="M15", snapshot_path=config.DATA_SNAPSHOT_M15)
     else:
         df = load_raw_bars(bars, use_snapshot=use_snapshot)
     X, y = build_dataset(df, target=target)
@@ -464,7 +479,7 @@ def train(bars: int, trials: int, target: str, use_snapshot: bool = False) -> di
         "is_multiclass": spec.is_multiclass,
         "num_class": spec.num_class,
         "symbol": config.SYMBOL,
-        "timeframe": "D1" if target == "direction_d1" else config.TIMEFRAME,
+        "timeframe": spec.timeframe,
         "horizon": spec.horizon,
         "threshold": "adaptive(ATR24 median)" if target in ("direction3", "direction_d1") else None,
         "adaptive_threshold": target in ("direction3", "direction_d1"),
@@ -551,9 +566,10 @@ def main() -> None:
     parser.add_argument("--trials", type=int, default=config.N_TRIALS)
     parser.add_argument(
         "--target",
-        choices=["breakout", "direction3", "direction_d1"],
+        choices=["breakout", "breakout_m15", "direction3", "direction_d1"],
         default="breakout",
-        help="breakout：二分类，预测下一根 K 线波动扩张；direction3：三分类，看空/观望/看多；"
+        help="breakout：二分类（H1），预测下一根 K 线波动扩张；breakout_m15：同任务 M15 版本，"
+             "预警提前约 45 分钟；direction3：三分类，看空/观望/看多；"
              "direction_d1：日线三分类，未来 5 个交易日方向",
     )
     parser.add_argument("--use-snapshot", action="store_true", help="复用 data/ 下的数据快照（不重新拉取）")

@@ -77,6 +77,7 @@ def _load_model(path_key: str):
     """加载模型并按文件 mtime 自动失效（重新训练后无需重启服务）。"""
     paths = {
         "breakout": config.BREAKOUT_MODEL_PATH,
+        "breakout_m15": config.BREAKOUT_M15_MODEL_PATH,
         "direction3": config.DIRECTION3_MODEL_PATH,
         "direction_d1": config.DIRECTION_D1_MODEL_PATH,
     }
@@ -342,6 +343,43 @@ def predict(symbol: str = config.SYMBOL, timeframe: str = config.TIMEFRAME) -> d
 
 
 @mcp.tool()
+def predict_m15(symbol: str = config.SYMBOL) -> dict:
+    """M15 波动扩张预测（二分类）：预测下一根 15 分钟 K 线振幅是否突破近 100 根中位数。
+
+    与 H1 版 predict 同任务，但周期是 M15——**预警提前约 45 分钟**：
+    H1 突破往往由 M15 先走出方向，适合突破前入场的短线参考。
+    需要 `uv run gold-train --target breakout_m15` 先训练。
+
+    返回字段同 predict（全中文），周期为 M15，含风险管理。
+    """
+    bundle = _load_model("breakout_m15")
+    row, df = _build_input_row(symbol, "M15", bundle)
+    proba = float(bundle["model"].predict(row)[0])
+    raw_signal = "EXPECT_EXPANSION" if proba >= 0.6 else "EXPECT_COMPRESSION" if proba <= 0.4 else "NEUTRAL"
+    quote = mt5_client.get_quote(symbol)
+    current_price = float(df["close"].iloc[-1])
+    atr = _get_atr(df)
+
+    result = {
+        "品种": symbol,
+        "周期": "M15",
+        "目标": "波动扩张（提前预警版）",
+        "扩张概率": round(proba, 4),
+        "信号": BREAKOUT_SIGNAL_CN[raw_signal],
+        "最新收盘价": round(current_price, 2),
+        "实时报价": quote,
+        "K线时间": str(df["time"].iloc[-1]),
+        "模型": "LightGBM + Optuna（二分类，M15）",
+        "支撑阻力": _get_support_resistance(df),
+    }
+
+    _add_risk_fields(result, current_price, atr, direction="neutral")
+    _add_market_status(result)
+    record_prediction("breakout_m15", result)
+    return result
+
+
+@mcp.tool()
 def predict_direction_3class(symbol: str = config.SYMBOL, timeframe: str = config.TIMEFRAME) -> dict:
     """方向三分类预测：未来 24 根 H1 K 线（约 1 个交易日）的方向 — 看空 / 观望 / 看多。
 
@@ -548,8 +586,8 @@ def check_drift(target: str = "direction3", bars: int = 500) -> dict:
     返回：结论（稳定/轻度漂移/显著漂移）、Top10 漂移特征、PSI 阈值。
     PSI > 0.25 的特征多时建议重训模型。
     """
-    if target not in ("breakout", "direction3", "direction_d1"):
-        raise ValueError("target 仅支持 breakout / direction3 / direction_d1")
+    if target not in ("breakout", "breakout_m15", "direction3", "direction_d1"):
+        raise ValueError("target 仅支持 breakout / breakout_m15 / direction3 / direction_d1")
     return drift_mod.check_drift(target=target, bars=bars)
 
 

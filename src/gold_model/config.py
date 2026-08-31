@@ -17,6 +17,10 @@ BARS = 50_000               # 拉取的 H1 K 线根数（受 MT5 终端历史限
 BREAKOUT_HORIZON = 1
 BREAKOUT_LOOKBACK = 100
 
+# M15 突破/扩张：更短周期版本，把波动扩张预警提前 ~45 分钟
+BREAKOUT_M15_MODEL_PATH = MODEL_DIR / "gold_lgbm_breakout_m15.pkl"
+DATA_SNAPSHOT_M15 = DATA_DIR / "xauusd_m15_snapshot.parquet"
+
 # 方向三分类：未来 24 根（约 1 个交易日）收益率划分
 DIRECTION3_HORIZON = 24
 DIRECTION3_THRESHOLD = 0.003  # 0.3%（固定阈值的回退值）

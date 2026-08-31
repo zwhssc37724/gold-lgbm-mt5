@@ -51,16 +51,17 @@ def load_ledger(days: int = 7) -> pd.DataFrame:
     return df[df["ts"] >= cutoff].reset_index(drop=True)
 
 
-def check_breakout(ledger: pd.DataFrame, klines: pd.DataFrame) -> dict:
-    """对账 breakout 记录：用真实 K 线重算标签。"""
-    recs = ledger[ledger["kind"] == "breakout"].copy()
+def check_breakout(ledger: pd.DataFrame, klines: pd.DataFrame, kind: str = "breakout",
+                   freq: str = "h") -> dict:
+    """对账 breakout / breakout_m15 记录：用真实 K 线重算标签。"""
+    recs = ledger[ledger["kind"] == kind].copy()
     if recs.empty:
         return {"记录数": 0}
     y = build_labels(klines, horizon=1, target="breakout")
     rng = (klines["high"] - klines["low"]) / klines["close"]
     base = rng.rolling(config.BREAKOUT_LOOKBACK).median()
 
-    time_to_idx = pd.Series(np.arange(len(klines)), index=klines["time"].dt.floor("h"))
+    time_to_idx = pd.Series(np.arange(len(klines)), index=klines["time"].dt.floor(freq))
     hits, total, probs, actuals = [], 0, [], []
     for _, r in recs.iterrows():
         t = r["kline_time"]
@@ -187,6 +188,11 @@ def run(days: int = 7) -> dict:
         d1 = mt5_client.get_klines(timeframe="D1", bars=200)
         if not mt5_client.is_synthetic(d1):
             out["direction_d1"] = check_direction_d1(ledger, d1)
+    # breakout_m15 需要 M15 数据
+    if (ledger["kind"] == "breakout_m15").any():
+        m15 = mt5_client.get_klines(timeframe="M15", bars=2000)
+        if not mt5_client.is_synthetic(m15):
+            out["breakout_m15"] = check_breakout(ledger, m15, kind="breakout_m15", freq="15min")
     out["台账路径"] = str(LEDGER)
     return out
 

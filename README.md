@@ -13,7 +13,8 @@
 ```bash
 cd E:\Documents\PythonProjects\gold-lgbm-mt5
 uv sync                                  # 首次：创建 .venv 并安装依赖
-uv run gold-train --target breakout      # 训练波动扩张模型（二分类）
+uv run gold-train --target breakout      # 训练波动扩张模型（H1 二分类）
+uv run gold-train --target breakout_m15  # 训练 M15 波动扩张模型（提前 ~45 分钟预警）
 uv run gold-train --target direction3    # 训练方向三分类模型
 uv run gold-train --target direction_d1  # 训练日线方向模型
 uv run gold-mcp                          # 启动 MCP 服务

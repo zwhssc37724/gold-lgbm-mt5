@@ -112,7 +112,7 @@ def check_drift(target: str = "direction3", bars: int = 500) -> dict:
             "建议": f"uv run gold-train --target {target} --use-snapshot",
         }
 
-    timeframe = "D1" if target == "direction_d1" else config.TIMEFRAME
+    timeframe = "D1" if target == "direction_d1" else ("M15" if target == "breakout_m15" else config.TIMEFRAME)
     # 滚动特征预热：ma_bias_200/vol_168 需要 200+ 根；D1 一次拉多了也就 4000 根
     warmup = 300 if timeframe != "D1" else 250
     df = mt5_client.get_klines(symbol=config.SYMBOL, timeframe=timeframe, bars=bars + warmup)
@@ -166,7 +166,8 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="特征漂移检查（PSI）")
-    parser.add_argument("--target", default="direction3", choices=["breakout", "direction3", "direction_d1"])
+    parser.add_argument("--target", default="direction3",
+                        choices=["breakout", "breakout_m15", "direction3", "direction_d1"])
     parser.add_argument("--bars", type=int, default=500)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
