@@ -25,6 +25,10 @@ def record_prediction(kind: str, result: dict) -> None:
 
     去重：同 (kind, kline_time) 只记一条——哨兵 30 分钟轮询时，
     同一根 H1 K 线会被预测两次，重复记录会让对账样本虚胖。
+
+    时区契约：kline_time 必须是 **MT5 服务器钟**（K线时间_服务器），
+    与 mt5_client.get_klines 返回的时间同基准，accuracy_check 靠它
+    做 join——展示用的 K线时间（北京时间）绝不能进台账。
     """
     try:
         rec = {
@@ -32,7 +36,7 @@ def record_prediction(kind: str, result: dict) -> None:
             "kind": kind,
             "signal": result.get("信号"),
             "price": result.get("最新收盘价"),
-            "kline_time": result.get("K线时间"),
+            "kline_time": result.get("K线时间_服务器") or result.get("K线时间"),
         }
         if kind in ("breakout", "breakout_m15"):
             rec["probability"] = result.get("扩张概率")

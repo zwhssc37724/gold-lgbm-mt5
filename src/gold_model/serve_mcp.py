@@ -116,6 +116,24 @@ def _add_market_status(result: dict) -> dict:
     return result
 
 
+def _kline_time_fields(df: pd.DataFrame) -> dict:
+    """生成 K 线时间的展示字段：北京时间为准，服务器钟留档。
+
+    注意：台账/对账（accuracy_check）用的 K线时间_服务器 保持服务器钟
+    语义不变，与历史记录 join 一致；只改展示。
+    """
+    t = df["time"].iloc[-1]
+    return {
+        "K线时间": mt5_client.to_beijing(t),
+        "K线时间_服务器": str(t),
+    }
+
+
+def _kline_time_cn(df: pd.DataFrame) -> str:
+    """单个北京时间的字符串（get_klines_summary 用）。"""
+    return mt5_client.to_beijing(df["time"].iloc[-1])
+
+
 def _get_atr(df: pd.DataFrame, period: int = 14) -> float:
     """计算 ATR（平均真实波幅）。"""
     high = df["high"]
@@ -141,7 +159,7 @@ def _get_support_resistance(df: pd.DataFrame, window: int = 20) -> dict:
 
 @mcp.tool()
 def get_quote(symbol: str = config.SYMBOL) -> dict:
-    """获取某品种的 MT5 实时报价（买价/卖价/最新价）。"""
+    """获取某品种的 MT5 实时报价（买价/卖价/中间价，时间为北京时间）。"""
     return _add_market_status(mt5_client.get_quote(symbol))
 
 
@@ -195,6 +213,7 @@ def get_klines(
             "是否截断": truncated,
             "最新时间": records[-1]["时间"] if records else None,
             "最旧时间": records[0]["时间"] if records else None,
+            "时区说明": "时间字段为 MT5 服务器时间（EET/EEST）",
         },
         "市场状态": mt5_client.is_market_open(),
     }
@@ -217,7 +236,7 @@ def get_klines_summary(symbol: str = config.SYMBOL, timeframe: str = config.TIME
         "品种": symbol,
         "周期": timeframe,
         "最新价格": round(float(latest["close"]), 2),
-        "最新时间": latest["time"].isoformat(),
+        "最新时间": _kline_time_cn(df),
         "24小时最高": round(float(prev_24["high"].max()), 2),
         "24小时最低": round(float(prev_24["low"].min()), 2),
         "24小时涨跌": round(float((latest["close"] / prev_24.iloc[0]["open"] - 1) * 100), 2),
@@ -254,7 +273,7 @@ def predict(symbol: str = config.SYMBOL, timeframe: str = config.TIMEFRAME) -> d
         "信号": BREAKOUT_SIGNAL_CN[raw_signal],
         "最新收盘价": round(current_price, 2),
         "实时报价": quote,
-        "K线时间": str(df["time"].iloc[-1]),
+        **_kline_time_fields(df),
         "模型": "LightGBM + Optuna（二分类）",
         "ATR14": round(atr, 2),
         "支撑阻力": _get_support_resistance(df),
@@ -289,7 +308,7 @@ def predict_m15(symbol: str = config.SYMBOL) -> dict:
         "信号": BREAKOUT_SIGNAL_CN[raw_signal],
         "最新收盘价": round(current_price, 2),
         "实时报价": quote,
-        "K线时间": str(df["time"].iloc[-1]),
+        **_kline_time_fields(df),
         "模型": "LightGBM + Optuna（二分类，M15）",
         "ATR14": round(atr, 2),
         "支撑阻力": _get_support_resistance(df),
@@ -335,7 +354,7 @@ def predict_direction_3class(symbol: str = config.SYMBOL, timeframe: str = confi
         "看多减看空置信度": round(confidence_long_short, 4),
         "最新收盘价": round(current_price, 2),
         "实时报价": quote,
-        "K线时间": str(df["time"].iloc[-1]),
+        **_kline_time_fields(df),
         "模型": "LightGBM + Optuna（三分类）",
         "预测周期": f"未来 {bundle.get('horizon', 24)} 根 K 线（{bundle.get('horizon', 24) * 60} 分钟）",
         "分类阈值": (
@@ -395,7 +414,7 @@ def predict_direction_d1(symbol: str = config.SYMBOL) -> dict:
         "看多减看空置信度": round(confidence, 4),
         "最新收盘价": round(current_price, 2),
         "实时报价": quote,
-        "K线时间": str(df["time"].iloc[-1]),
+        **_kline_time_fields(df),
         "模型": "LightGBM + Optuna（D1 三分类）",
         "预测周期": f"未来 {bundle.get('horizon', 5)} 个交易日",
         "分类阈值": (
@@ -547,7 +566,7 @@ def get_comprehensive_analysis() -> dict:
         "CFTC持仓": cftc.get_cftc_summary(),
         "GLD持仓": gld_holdings.get_gld_summary(),
         "市场状态": mt5_client.is_market_open(),
-        "时间": pd.Timestamp.now(tz="UTC").isoformat(),
+        "时间": mt5_client.now_beijing(),
     }
 
 

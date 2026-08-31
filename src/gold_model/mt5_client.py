@@ -39,6 +39,52 @@ SOURCE_MT5 = "mt5"
 SOURCE_SYNTH = "synthetic"
 
 # ---------------------------------------------------------------------------
+# 时区：MT5 返回的 UNIX 时间戳是「服务器墙上钟」而非 UTC
+# ---------------------------------------------------------------------------
+# MetaTrader5 API 把 tick.time / rates.time 按「终端服务器时区」解释：
+# 实测（2026-08-31）TradeMax 服务器显示 05:16 时真实 UTC 是 02:16，即
+# 服务器 = EET/EEST（UTC+2 冬令 / UTC+3 夏令，随欧美夏令时切换）。
+# 现有代码 pd.Timestamp(x, unit="s", tz="UTC") 把它误标成了 UTC。
+# 注意：训练特征/标签/对账全部建立在服务器钟上，本函数只用于**展示层**，
+# 严禁用于特征构建——否则会造成特征偏移。
+import pytz  # noqa: E402
+
+SERVER_TZ = pytz.timezone("Europe/Athens")  # EET/EEST，与 TradeMax 一致
+BEIJING_TZ = pytz.timezone("Asia/Shanghai")
+_CN_SUFFIX = "（北京时间）"
+
+
+def to_beijing_ts(ts) -> pd.Timestamp:
+    """to_beijing 的时间戳版本（返回 tz-aware 北京时间 Timestamp）。
+
+    DataFrame 列用它（时间差/小时运算可用），MCP 输出层用 to_beijing 转字符串。
+    """
+    t = pd.Timestamp(ts)
+    if t.tzinfo is None:
+        t = t.tz_localize(SERVER_TZ)
+    elif str(t.tzinfo) in ("UTC", "+00:00", "utc"):
+        # 历史遗留：mt5_client 把服务器钟打上了 UTC 标签，先剥掉再重贴
+        t = t.tz_localize(None).tz_localize(SERVER_TZ)
+    return t.tz_convert(BEIJING_TZ)
+
+
+def to_beijing(ts) -> str:
+    """把 MT5 服务器墙上钟时间戳（被误标 UTC）转成北京时间字符串。
+
+    接受 pd.Timestamp / datetime / ISO 字符串：
+      - naive → 视为服务器墙上钟；
+      - tz-aware 且带 +00:00 → 先去标签（历史数据是误标的 UTC）再按服务器钟解释；
+      - 其他 tz-aware → 正常换算。
+    返回带 +08:00 后缀的 ISO 字符串。
+    """
+    return to_beijing_ts(ts).isoformat()
+
+
+def now_beijing() -> str:
+    """当前真实北京时间（ISO 字符串，+08:00）。"""
+    return pd.Timestamp.now(tz=BEIJING_TZ).isoformat()
+
+# ---------------------------------------------------------------------------
 # Shared, locked MT5 connection
 # ---------------------------------------------------------------------------
 
@@ -154,8 +200,8 @@ def is_market_open(symbol: str = config.SYMBOL) -> dict:
         next_open = _next_sunday_22utc(now_utc)
         return {
             "状态": "weekend",
-            "当前时间": now_utc.isoformat(),
-            "下次开市": next_open.isoformat() if next_open else None,
+            "当前时间": now_utc.tz_convert(BEIJING_TZ).isoformat(),
+            "下次开市": next_open.tz_convert(BEIJING_TZ).isoformat() if next_open else None,
             "说明": "周末休市，黄金市场周日 22:00 UTC 开市",
         }
 
@@ -163,8 +209,8 @@ def is_market_open(symbol: str = config.SYMBOL) -> dict:
         next_open = now_utc.replace(hour=22, minute=0, second=0, microsecond=0)
         return {
             "状态": "weekend",
-            "当前时间": now_utc.isoformat(),
-            "下次开市": next_open.isoformat() if next_open else None,
+            "当前时间": now_utc.tz_convert(BEIJING_TZ).isoformat(),
+            "下次开市": next_open.tz_convert(BEIJING_TZ).isoformat() if next_open else None,
             "说明": "周末休市，今晚 22:00 UTC 开市",
         }
 
@@ -175,20 +221,22 @@ def is_market_open(symbol: str = config.SYMBOL) -> dict:
             try:
                 tick = mt5.symbol_info_tick(symbol)
                 if tick is not None:
+                    # 展示层全部用北京时间；内部 age 计算仍用误标 UTC 的
+                    # 服务器钟（与 tick_time 同基准，差值正确）
                     tick_time = pd.Timestamp(tick.time, unit="s", tz="UTC")
                     age_minutes = (pd.Timestamp.now(tz="UTC") - tick_time).total_seconds() / 60
                     if age_minutes > 5:
                         return {
                             "状态": "closed",
-                            "当前时间": now_utc.isoformat(),
-                            "数据时间": tick_time.isoformat(),
+                            "当前时间": now_beijing(),
+                            "数据时间": to_beijing(tick_time),
                             "数据延迟分钟": round(age_minutes, 1),
                             "说明": f"市场已关闭，最新数据来自 {round(age_minutes)} 分钟前",
                         }
                     return {
                         "状态": "open",
-                        "当前时间": now_utc.isoformat(),
-                        "数据时间": tick_time.isoformat(),
+                        "当前时间": now_beijing(),
+                        "数据时间": to_beijing(tick_time),
                         "说明": "市场开市，数据实时",
                     }
             except Exception as exc:
@@ -196,7 +244,7 @@ def is_market_open(symbol: str = config.SYMBOL) -> dict:
 
     return {
         "状态": "unknown",
-        "当前时间": now_utc.isoformat(),
+        "当前时间": now_utc.tz_convert(BEIJING_TZ).isoformat(),
         "说明": "无法连接 MT5，市场状态未知",
     }
 
@@ -225,17 +273,17 @@ def get_quote(symbol: str = config.SYMBOL) -> dict:
                     mt5.symbol_select(symbol, True)
                     tick = mt5.symbol_info_tick(symbol)
                 if tick is not None:
+                    # MT5 的 tick.last 对现货黄金恒为 0（无逐笔最新价），不输出，
+                    # 报价语义以买卖双边为准，中间价 = (bid+ask)/2
                     tick_time = pd.Timestamp(tick.time, unit="s", tz="UTC")
                     age_seconds = (pd.Timestamp.now(tz="UTC") - tick_time).total_seconds()
                     data_fresh = age_seconds < 60
-                    # MT5 的 tick.last 对现货黄金恒为 0（无逐笔最新价），不输出，
-                    # 报价语义以买卖双边为准，中间价 = (bid+ask)/2
                     return {
                         "品种": symbol,
                         "买价": float(tick.bid),
                         "卖价": float(tick.ask),
                         "中间价": round((float(tick.bid) + float(tick.ask)) / 2, 2),
-                        "时间": tick_time.isoformat(),
+                        "时间": to_beijing(tick_time),
                         "数据来源": "MT5 实时" if data_fresh else "MT5 延迟",
                         "数据新鲜度": "实时" if data_fresh else f"延迟 {int(age_seconds)} 秒",
                         "市场状态": "开市" if data_fresh else "休市/延迟",

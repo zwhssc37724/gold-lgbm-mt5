@@ -13,6 +13,8 @@ datetime（TradeMax 服务器 = UTC+2/3），所以用本地 naive 时间构造�
 - 直接 import MetaTrader5 调用（与 mt5_client 的懒初始化无关，独立连接）
 - MT5 不可用 → 抛 RuntimeError（MCP 层转成 {"错误": ...}）
 - 输出中文键，原始语义保留：盈亏 = profit + commission + swap（已实现）
+- 输出的时间列已是北京时间（mt5_client.to_beijing 转换，服务器钟 EET/EEST）；
+  配对/持仓时长计算不受影响（同一时区内做差）
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from gold_model import config
+from gold_model.mt5_client import to_beijing, to_beijing_ts
 
 logger = logging.getLogger("gold_model.trade_history")
 
@@ -88,7 +91,7 @@ def get_deals(days: int | None = None, period: str | None = None,
         if symbol and symbol not in d.symbol:
             continue
         rows.append({
-            "时间": t,
+            "时间": to_beijing_ts(t),
             "订单号": d.order,
             "品种": d.symbol,
             "类型": DEAL_TYPE_CN.get(d.type, str(d.type)),
@@ -124,7 +127,7 @@ def get_orders(days: int | None = None, period: str | None = None,
         if symbol and symbol not in o.symbol:
             continue
         rows.append({
-            "下单时间": t,
+            "下单时间": to_beijing_ts(t),
             "订单号": o.ticket,
             "品种": o.symbol,
             "订单类型": ORDER_TYPE_CN.get(o.type, str(o.type)),
@@ -133,7 +136,7 @@ def get_orders(days: int | None = None, period: str | None = None,
             "止损": float(o.sl) if o.sl else None,
             "止盈": float(o.tp) if o.tp else None,
             "状态": ORDER_STATE_CN.get(o.state, str(o.state)),
-            "完成时间": pd.Timestamp(o.time_done, unit="s") if o.time_done else None,
+            "完成时间": to_beijing_ts(pd.Timestamp(o.time_done, unit="s")) if o.time_done else None,
             "注释": o.comment,
         })
     if not rows:
