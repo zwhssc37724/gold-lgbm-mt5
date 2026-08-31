@@ -1,10 +1,11 @@
 # 黄金交易模型（MT5 + Optuna + LightGBM + HTTP MCP）
 
-基于本机 MetaTrader 5 终端的 XAUUSD（黄金）交易模型，Python 3.12 + uv 工程，LightGBM + Optuna（TPE）调参，通过 streamable-http MCP 对外提供**报价、K 线、波动扩张预测、方向三分类预测、CFTC 持仓、GLD 持仓、漂移检查**等独家能力。
+基于本机 MetaTrader 5 终端的 XAUUSD（黄金）交易模型，Python 3.12 + uv 工程，LightGBM + Optuna（TPE）调参，通过 streamable-http MCP 对外提供**报价、K 线、四模型预测、CFTC/GLD 持仓、交易记录、漂移检查**等能力。
 
-> **2026-08-31 重构**：财经资讯/宏观数据类工具已剥离，统一使用外部 MCP——
-> 快讯/日历 → `jin10` MCP；美债收益率/利率 → `Alpha Vantage` MCP；跨资产行情 → `Alpha Vantage`/`Massive` MCP。
-> 本项目 MCP 只保留**独家能力**（MT5 实盘数据 + 自训模型 + CFTC/GLD 抓取）。
+> **职责边界（2026-08-31 整改）**：本项目只做**模型计算 + 数据取数**，输出纯数据
+> （概率/置信度/ATR/支撑阻力/持仓/成交记录）。**分析、解读、操作建议由上层 agent 负责**——
+> MCP 工具不再输出止损止盈建议、Kelly 仓位、信号解读等任何建议性内容。
+> 财经资讯/宏观数据类工具此前已剥离至外部 MCP（jin10、Alpha Vantage 等）。
 
 ---
 

@@ -32,16 +32,11 @@ logger = logging.getLogger("gold_model.mcp")
 
 mcp = MCPServer("gold-trading-model")
 
-# 输出标签中英文映射
+# 输出标签中英文映射（纯语义翻译，不含操作建议——分析由上层 agent 负责）
 BREAKOUT_SIGNAL_CN = {
     "EXPECT_EXPANSION": "预期扩张",
     "EXPECT_COMPRESSION": "预期收敛",
     "NEUTRAL": "中性",
-}
-DIRECTION3_SIGNAL_CN = {
-    0: "看空（开空仓）",
-    1: "观望（不操作）",
-    2: "看多（开多仓）",
 }
 KLINE_FIELD_CN = {
     "time": "时间",
@@ -119,76 +114,6 @@ def _add_market_status(result: dict) -> dict:
     """给结果添加市场状态字段。"""
     result["市场状态"] = mt5_client.is_market_open()
     return result
-
-
-def _add_risk_fields(
-    result: dict,
-    current_price: float,
-    atr: float,
-    direction: str = "neutral",
-    calibrated_prob: float | None = None,
-) -> dict:
-    """给预测结果添加风险管理字段。
-
-    参数：
-      - current_price: 当前价格
-      - atr: 平均真实波幅（用于计算止损）
-      - direction: "long" / "short" / "neutral"
-      - calibrated_prob: 校准后的方向概率（0~1）；提供时输出 1/4 Kelly 仓位建议
-    """
-    # 基于 ATR 的止损建议
-    if direction == "long":
-        stop_loss = current_price - atr * 2
-        take_profit_1 = current_price + atr * 2  # 1:1
-        take_profit_2 = current_price + atr * 4  # 2:1
-    elif direction == "short":
-        stop_loss = current_price + atr * 2
-        take_profit_1 = current_price - atr * 2
-        take_profit_2 = current_price - atr * 4
-    else:
-        stop_loss = current_price - atr * 2
-        take_profit_1 = current_price + atr * 2
-        take_profit_2 = current_price + atr * 4
-
-    risk_reward_1 = abs(take_profit_1 - current_price) / abs(current_price - stop_loss)
-    risk_reward_2 = abs(take_profit_2 - current_price) / abs(current_price - stop_loss)
-
-    result["风险管理"] = {
-        "当前价格": round(current_price, 2),
-        "ATR（平均波幅）": round(atr, 2),
-        "建议止损": round(stop_loss, 2),
-        "建议止盈1（1:1）": round(take_profit_1, 2),
-        "建议止盈2（2:1）": round(take_profit_2, 2),
-        "风险回报比1": round(risk_reward_1, 2),
-        "风险回报比2": round(risk_reward_2, 2),
-        "建议仓位": "轻仓（≤5%）" if direction != "neutral" else "观望",
-    }
-
-    # 1/4 Kelly 仓位建议（需要校准概率；风报比按 2:1 的止盈计）
-    if calibrated_prob is not None and direction in ("long", "short"):
-        b = risk_reward_2  # 赔率（盈亏比）
-        p = float(calibrated_prob)
-        kelly = max(0.0, (p * (1 + b) - 1) / b)  # f* = (p(b+1)-1)/b
-        quarter = kelly / 4
-        result["风险管理"]["Kelly仓位(1/4)"] = (
-            f"{quarter * 100:.1f}% 资金（全 Kelly {kelly * 100:.1f}%，校准p={p:.2f}，赔率{b:.1f}）"
-            if quarter > 0.001
-            else f"0%（校准概率不足以覆盖赔率，p={p:.2f} 需 > {1 / (1 + b):.2f}）"
-        )
-    return result
-
-
-def _high_confidence_flag(confidence: float) -> str:
-    """置信度门控标注（基于 2026-08 walk-forward 实验数据）。
-
-    |置信度| > 0.25 的历史样本外表现：多头方向命中率 72%（基线 39%，z=7.4），
-    含成本回测胜率 76%（17 笔）；置信度不足 0.20 时信号≈随机，建议观望。
-    """
-    if confidence > 0.25:
-        return "是（多头高置信：历史命中率 72%，基线 39%）"
-    if confidence < -0.25:
-        return "是（空头高置信：历史上空头腿较弱，谨慎参考）"
-    return "否（|置信度|<0.25，历史表现≈随机，建议观望）"
 
 
 def _get_atr(df: pd.DataFrame, period: int = 14) -> float:
@@ -307,13 +232,10 @@ def get_klines_summary(symbol: str = config.SYMBOL, timeframe: str = config.TIME
 def predict(symbol: str = config.SYMBOL, timeframe: str = config.TIMEFRAME) -> dict:
     """波动扩张预测（二分类）：预测下一根 K 线振幅是否突破近 100 根中位数。
 
-    返回字段（全部中文）：
-      - 品种、周期
-      - 目标：波动扩张
+    纯数据输出（不含操作建议，分析由上层 agent 负责）：
       - 扩张概率：模型输出 0~1
-      - 信号：预期扩张 / 预期收敛 / 中性
-      - 最新收盘价、实时报价、K线时间、模型
-      - 风险管理：止损、止盈、风险回报比、建议仓位
+      - 信号类别：预期扩张 / 预期收敛 / 中性
+      - 最新收盘价、实时报价、K线时间、模型、ATR14、支撑阻力
       - 市场状态
     """
     bundle = _load_model("breakout")
@@ -334,10 +256,10 @@ def predict(symbol: str = config.SYMBOL, timeframe: str = config.TIMEFRAME) -> d
         "实时报价": quote,
         "K线时间": str(df["time"].iloc[-1]),
         "模型": "LightGBM + Optuna（二分类）",
+        "ATR14": round(atr, 2),
         "支撑阻力": _get_support_resistance(df),
     }
 
-    _add_risk_fields(result, current_price, atr, direction="neutral")
     _add_market_status(result)
     record_prediction("breakout", result)
     return result
@@ -347,11 +269,9 @@ def predict(symbol: str = config.SYMBOL, timeframe: str = config.TIMEFRAME) -> d
 def predict_m15(symbol: str = config.SYMBOL) -> dict:
     """M15 波动扩张预测（二分类）：预测下一根 15 分钟 K 线振幅是否突破近 100 根中位数。
 
-    与 H1 版 predict 同任务，但周期是 M15——**预警提前约 45 分钟**：
-    H1 突破往往由 M15 先走出方向，适合突破前入场的短线参考。
+    与 H1 版 predict 同任务，但周期是 M15——**预警提前约 45 分钟**。
     需要 `uv run gold-train --target breakout_m15` 先训练。
-
-    返回字段同 predict（全中文），周期为 M15，含风险管理。
+    纯数据输出（同 predict，分析由上层 agent 负责）。
     """
     bundle = _load_model("breakout_m15")
     row, df = _build_input_row(symbol, "M15", bundle)
@@ -371,10 +291,10 @@ def predict_m15(symbol: str = config.SYMBOL) -> dict:
         "实时报价": quote,
         "K线时间": str(df["time"].iloc[-1]),
         "模型": "LightGBM + Optuna（二分类，M15）",
+        "ATR14": round(atr, 2),
         "支撑阻力": _get_support_resistance(df),
     }
 
-    _add_risk_fields(result, current_price, atr, direction="neutral")
     _add_market_status(result)
     record_prediction("breakout_m15", result)
     return result
@@ -384,17 +304,14 @@ def predict_m15(symbol: str = config.SYMBOL) -> dict:
 def predict_direction_3class(symbol: str = config.SYMBOL, timeframe: str = config.TIMEFRAME) -> dict:
     """方向三分类预测：未来 24 根 H1 K 线（约 1 个交易日）的方向 — 看空 / 观望 / 看多。
 
-    标签定义（按未来 24 根对数收益率）：
-      - 0 看空：  收益率 < -0.3%
-      - 1 观望：  -0.3% ≤ 收益率 ≤ +0.3%
-      - 2 看多：  收益率 > +0.3%
+    标签定义（按未来 24 根对数收益率，自适应阈值）：
+      - 0 看空 / 1 观望 / 2 看多
 
-    返回字段：
-      - 看空概率、观望概率、看多概率（三类概率分布）
-      - 信号：概率最大的类别（带仓位建议）
-      - 预测类别、看多减看空置信度、最新收盘价、实时报价、K线时间、模型
-      - 风险管理：止损、止盈、风险回报比、建议仓位
-      - 支撑阻力位
+    纯数据输出（不含操作建议，分析由上层 agent 负责）：
+      - 看空概率、观望概率、看多概率（三类分布）
+      - 预测类别、看多减看空置信度
+      - 校准概率（isotonic，历史同置信度下的真实方向频率）
+      - 最新收盘价、实时报价、K线时间、模型、ATR14、支撑阻力
       - 市场状态
     """
     bundle = _load_model("direction3")
@@ -407,10 +324,6 @@ def predict_direction_3class(symbol: str = config.SYMBOL, timeframe: str = confi
     current_price = float(df["close"].iloc[-1])
     atr = _get_atr(df)
 
-    # 确定方向用于风控计算
-    direction_map = {0: "short", 1: "neutral", 2: "long"}
-    direction = direction_map[pred_class]
-
     result = {
         "品种": symbol,
         "周期": timeframe,
@@ -418,10 +331,8 @@ def predict_direction_3class(symbol: str = config.SYMBOL, timeframe: str = confi
         "看空概率": round(float(proba_vec[0]), 4),
         "观望概率": round(float(proba_vec[1]), 4),
         "看多概率": round(float(proba_vec[2]), 4),
-        "信号": DIRECTION3_SIGNAL_CN[pred_class],
         "预测类别": DIRECTION3_NAMES_CN[pred_class],
         "看多减看空置信度": round(confidence_long_short, 4),
-        "高置信信号": _high_confidence_flag(confidence_long_short),
         "最新收盘价": round(current_price, 2),
         "实时报价": quote,
         "K线时间": str(df["time"].iloc[-1]),
@@ -432,25 +343,20 @@ def predict_direction_3class(symbol: str = config.SYMBOL, timeframe: str = confi
             if bundle.get("adaptive_threshold")
             else f"±{float(bundle.get('threshold') or 0.003) * 100:.2f}%"
         ),
+        "ATR14": round(atr, 2),
         "支撑阻力": _get_support_resistance(df),
     }
 
-    # 校准概率（isotonic 校准器存在时）：把原始置信度翻译成真实频率含义
-    calibrated_prob = None
+    # 校准概率（isotonic 校准器存在时）：把原始置信度翻译成真实频率
     try:
         calib = calibration.load_calibrators(config.DIRECTION3_MODEL_PATH)
         if calib is not None:
             calibrated = calibration.calibrate_confidence(calib, confidence_long_short)
             result["校准概率"] = calibrated
-            result["校准概率说明"] = "历史同置信度情形下的真实方向频率（isotonic，WF 样本外拟合）"
-            if confidence_long_short >= 0:
-                calibrated_prob = calibrated.get("看涨概率(校准)")
-            else:
-                calibrated_prob = calibrated.get("看跌概率(校准)")
+            result["校准方法"] = "isotonic，WF 样本外拟合"
     except Exception as exc:  # 校准失败不影响预测
         logger.warning("calibration lookup failed: %s", exc)
 
-    _add_risk_fields(result, current_price, atr, direction=direction, calibrated_prob=calibrated_prob)
     _add_market_status(result)
     record_prediction("direction3", result)
     return result
@@ -460,20 +366,14 @@ def predict_direction_3class(symbol: str = config.SYMBOL, timeframe: str = confi
 def predict_direction_d1(symbol: str = config.SYMBOL) -> dict:
     """日线方向三分类预测：未来 5 个交易日的方向 — 看空 / 观望 / 看多。
 
-    定位（2026-08-30 实验结论，experiments/ + data/reports/）：
-      - 单独交易无效：WF 宏 AUC 0.559 高于基线 0.5（5 窗口全部 >0.5），
-        但含成本回测夏普 3.74 与「随机同频率开多」对照（3.22-4.28）无显著差异
-        ——独立使用只是黄金多头 beta。
-      - 正确用法是当 H1 方向信号的过滤器（样本外 2025-10~2026-08 交叉验证）：
-        H1 置信度>0.25 的多头信号，叠加本模型「看多」（conf>0）后命中率 95%（19/20，n=20）；
-        不加过滤为 86.6%。本模型看空时 H1 信号命中率跌到 65%（n=46）。
-      - 因此本工具输出的是「过滤意见」而非独立开仓信号。
+    模型定位（实验结论，供上层 agent 参考的事实）：
+      - WF 宏 AUC 0.559（5 窗口全 >0.5），但独立交易无效（≈黄金多头 beta）
+      - 实验支持其作为 H1 高置信信号的过滤器使用
 
-    返回字段：
-      - 看空/观望/看多概率（三类分布）
-      - 预测类别、看多减看空置信度
-      - 过滤意见：可与 H1 高置信多头信号叠加 / 中性 / 与多头信号相反（建议放弃）
-      - 风险管理（D1 尺度 ATR）、支撑阻力（近 20 日）、市场状态
+    纯数据输出（不含操作建议）：
+      - 看空/观望/看多概率、预测类别、看多减看空置信度
+      - 最新收盘价、实时报价、K线时间、模型、ATR14、支撑阻力（近 20 日）
+      - 市场状态
     """
     bundle = _load_model("direction_d1")
     row, df = _build_input_row(symbol, "D1", bundle)
@@ -484,16 +384,6 @@ def predict_direction_d1(symbol: str = config.SYMBOL) -> dict:
     current_price = float(df["close"].iloc[-1])
     atr = _get_atr(df)
 
-    direction_map = {0: "short", 1: "neutral", 2: "long"}
-    direction = direction_map[pred_class]
-
-    if confidence > 0.0:
-        filter_opinion = "与 H1 多头信号同向（可叠加：历史命中 95% vs 不叠加 86.6%）"
-    elif confidence > -0.25:
-        filter_opinion = "中性（对本模型置信度不足，过滤效果未验证）"
-    else:
-        filter_opinion = "与 H1 多头信号相反（历史该情形 H1 命中率降至 65%，建议放弃或减仓）"
-
     result = {
         "品种": symbol,
         "周期": "D1",
@@ -501,11 +391,8 @@ def predict_direction_d1(symbol: str = config.SYMBOL) -> dict:
         "看空概率": round(float(proba_vec[0]), 4),
         "观望概率": round(float(proba_vec[1]), 4),
         "看多概率": round(float(proba_vec[2]), 4),
-        "信号": DIRECTION3_SIGNAL_CN[pred_class],
         "预测类别": DIRECTION3_NAMES_CN[pred_class],
         "看多减看空置信度": round(confidence, 4),
-        "过滤意见": filter_opinion,
-        "独立性说明": "本模型单独交易无效（=多头beta）；仅作为 H1 高置信信号的过滤器使用",
         "最新收盘价": round(current_price, 2),
         "实时报价": quote,
         "K线时间": str(df["time"].iloc[-1]),
@@ -516,10 +403,10 @@ def predict_direction_d1(symbol: str = config.SYMBOL) -> dict:
             if bundle.get("adaptive_threshold")
             else f"±{float(bundle.get('threshold') or 0.003) * 100:.2f}%"
         ),
+        "ATR14": round(atr, 2),
         "支撑阻力": _get_support_resistance(df, window=20),
     }
 
-    _add_risk_fields(result, current_price, atr, direction=direction)
     _add_market_status(result)
     record_prediction("direction_d1", result)
     return result
