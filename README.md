@@ -1,6 +1,10 @@
-# 黄金交易模型（MT5 + Optuna + LightGBM + HTTP MCP）
+# 黄金交易模型（MT5 + Optuna + LightGBM）
 
-基于本机 MetaTrader 5 终端的 XAUUSD（黄金）交易模型，Python 3.12 + uv 工程，LightGBM + Optuna（TPE）调参，通过 streamable-http MCP 对外提供**报价、K 线、波动扩张预测、方向三分类预测**四个能力。
+基于本机 MetaTrader 5 终端的 XAUUSD（黄金）交易模型训练/评估管线，Python 3.12 + uv 工程，
+LightGBM + Optuna（TPE）调参。
+
+> **实时预测与宏观数据**：由外部 `gold-trading` MCP 服务器提供（Hermes 内置），
+> 本项目仅负责**训练、回测、漂移监控、对账**。重构于 2026-08-31。
 
 ---
 
@@ -11,169 +15,40 @@ cd E:\Documents\PythonProjects\gold-lgbm-mt5
 uv sync                                  # 首次：创建 .venv 并安装依赖
 uv run gold-train --target breakout      # 训练波动扩张模型（二分类）
 uv run gold-train --target direction3    # 训练方向三分类模型
-uv run gold-mcp                          # 启动 MCP 服务
+uv run gold-train --target direction_d1  # 训练日线方向模型
 ```
 
-服务启动后监听 `http://127.0.0.1:8000/mcp`，MCP 客户端接入：
+## 预测能力（由外部 MCP 提供）
 
-```json
-{ "mcpServers": { "gold-model": { "url": "http://127.0.0.1:8000/mcp" } } }
-```
-
----
-
-## 预测能力
-
-| 工具 | 任务 | 含义 | 真实数据样本外表现 |
-|---|---|---|---|
-| `predict` | 波动扩张（breakout，二分类） | 下一根 K 线振幅是否突破近 100 根中位数 | 测试集 AUC **0.764**，walk-forward 0.771±0.016，超基线 0.652 |
-| `predict_direction_3class` | 方向三分类（看空/观望/看多） | 未来 24 根 H1 K 线（约 1 个交易日）的方向 | 宏AUC 0.539±0.038 未超基线；但置信度门控 \|p多−p空\|>0.25 的多头腿命中 72%（基线 39%，z=7.4），见「置信度门控」一节 |
-| `predict_direction_d1` | 日线方向三分类（未来 5 个交易日） | D1 尺度方向，宏观特征咬合更好 | WF 宏AUC 0.559（5 窗口全>0.5），但**独立交易无效**（=多头 beta）；正确用法是当 H1 高置信信号的**过滤器**（叠加后命中率 95% vs 86.6%） |
-
-### 方向三分类标签定义
-
-按未来 24 根 H1 K 线对数收益率划分（阈值 ±0.3%）：
-
-| 类别 | 名称 | 含义 |
+| 工具 | 任务 | 含义 |
 |---|---|---|
-| 0 | 看空 | 24 根对数收益 < -0.3% |
-| 1 | 观望 | -0.3% ≤ 24 根对数收益 ≤ +0.3% |
-| 2 | 看多 | 24 根对数收益 > +0.3% |
+| `predict` | 波动扩张（breakout，二分类） | 下一根 K 线振幅是否突破近 100 根中位数 |
+| `predict_direction_3class` | 方向三分类（看空/观望/看多） | 未来 24 根 H1 K 线（约 1 个交易日）的方向 |
+| `predict_direction_d1` | 日线方向三分类（未来 5 个交易日） | D1 尺度方向，作为 H1 高置信信号的过滤器 |
 
-**为什么三分类里默认带观望档？** 真实黄金 H1 单根方向预测样本外 AUC 长期在 0.5x，强行做"非多即空"会被噪声拖垮；用 0.3% 阈值划出"不动"档可显著降低交易磨损，对应人工交易中"看不清就不开仓"的纪律。
-
-### 为什么不默认用涨跌方向二分类
-
-涨跌方向在有效市场下真实样本外 AUC ≈ 0.51——任何声称 0.7+ 的方向模型必然来自数据泄漏或过拟合。本项目提供波动扩张（AUC 0.77，可用于突破/止损定宽）和方向三分类（带观望）两个真实可学的目标。
-
----
-
-## MCP 工具列表（http://127.0.0.1:8000/mcp）
-
-| 工具名 | 说明 | 返回字段（全中文） |
-|---|---|---|
-| `get_quote(symbol)` | MT5 实时报价 | 品种、买价、卖价、最新价、时间、数据来源、数据新鲜度、市场状态 |
-| `get_klines(symbol, timeframe, bars, 范围)` | MT5 K 线 | 数据（时间、开盘价、最高价、最低价、收盘价、成交量、点差）、统计、市场状态 |
-| `get_klines(范围="一周")` | 按时间范围取 K 线（近一周数据） | 同上，一周 = 近 5 个交易日 |
-| `get_klines_summary(symbol, timeframe)` | K 线摘要（不返回原始数据） | 最新价格、24小时高低点、涨跌、成交量、ATR、支撑阻力、市场状态 |
-| `get_market_status()` | 获取市场状态 | 状态（开市/休市/周末）、当前时间、下次开市、说明 |
-| `predict(symbol, timeframe)` | 波动扩张预测 | 品种、周期、目标、扩张概率、信号、最新收盘价、实时报价、K线时间、模型、支撑阻力、风险管理、市场状态 |
-| `predict_direction_3class(symbol, timeframe)` | 方向三分类预测 | 品种、周期、目标、看空概率、观望概率、看多概率、信号、预测类别、看多减看空置信度、高置信信号、最新收盘价、实时报价、K线时间、模型、预测周期、分类阈值、支撑阻力、风险管理、市场状态 |
-| `predict_direction_d1(symbol)` | 日线方向三分类预测（未来 5 个交易日） | 同上（D1 尺度）+ 过滤意见（对 H1 高置信信号的叠加/中性/相反判定）、独立性说明 |
-| `get_today_events()` | 获取今天的重要财经事件 | 日期、事件数量、事件列表（含影响分析）、市场状态 |
-| `get_upcoming_events(days)` | 获取未来几天的重要财经事件 | 查询范围、事件数量、事件列表（含影响分析）、市场状态 |
-| `get_flash_news(limit)` | 获取最新金十快讯 | 数量、快讯列表、市场状态 |
-| `analyze_event(title, country)` | 分析特定财经事件对黄金的影响 | 事件、国家、事件类型、重要性、影响分析（含交易建议）、市场状态 |
-| `get_macro_data()` | 获取宏观数据汇总 | 美元指数、美债收益率、VIX、金银比、金油比、黄金情绪、市场状态 |
-| `get_cftc_position()` | 获取 CFTC 黄金持仓报告 | 报告日期、非商业净多头、净多头变化、情绪判断、数据来源 |
-| `get_real_yield()` | 获取美债实际收益率 | 实际收益率、通胀预期、名义收益率、分析、数据来源 |
-| `get_gld_holdings()` | 获取 GLD 黄金 ETF 持仓量 | 持仓量（吨）、持仓量（盎司）、日期、数据来源 |
-| `get_fedwatch()` | 获取 CME FedWatch 利率概率 | 当前利率、市场预期、数据来源 |
-| `get_comprehensive_analysis()` | 获取黄金综合分析（所有数据源汇总） | MT5模型预测、宏观数据、黄金情绪、CFTC持仓、实际收益率、GLD持仓、利率预期、市场状态、时间 |
-
-信号含义：
-- 波动扩张：`预期扩张`（≥0.6）/ `预期收敛`（≤0.4）/ `中性`
-- 方向三分类：`看空（开空仓）` / `观望（不操作）` / `看多（开多仓）`
-
-风险管理字段（所有预测工具都包含）：
-- 当前价格、ATR（平均波幅）
-- 建议止损、建议止盈1（1:1）、建议止盈2（2:1）
-- 风险回报比1、风险回报比2、建议仓位
-
-`范围` 参数（可选值与换算，一周 = 近 5 个交易日）：
-
-| 范围 | M15 | H1 | H4 | D1 |
-|---|---|---|---|---|
-| 一天 | 96 根 | 24 根 | 6 根 | — |
-| 一周 | 480 根 | 120 根 | 30 根 | 10 根 |
-| 一个月 | 2,112 根 | 528 根 | 132 根 | 22 根 |
-| 三个月 | 6,336 根 | 1,584 根 | 396 根 | 66 根 |
-| 半年 | 12,672 根 | 3,168 根 | 792 根 | 132 根 |
-| 一年 | 25,344 根 | 6,336 根 | 1,584 根 | 264 根 |
-
-> 指定 `范围` 后忽略 `bars`；两者都不传时默认返回最近 500 根。
-> `get_klines` 默认最多返回 500 根，防止数据量过大。如需更多数据，请使用 `限制` 参数。
+实时报价、K 线、宏观数据（DXY/VIX/美债）、CFTC 持仓、GLD 持仓、FedWatch、
+金十快讯 → 全部由 MCP 工具 `mcp__gold_trading__*` 提供。
 
 ---
 
 ## 评估协议（防泄漏）
 
-1. **数据**：MT5 拉取 XAUUSD H1，经月度密度过滤剔除伪装成 H1 的日线历史后 20,176 根（2023-04 至今，经纪商仅提供 2023-03 之后的真实 H1 深度）；存 parquet 快照保证可复现
-2. **防泄漏切分**：末 20% 为不打扰的测试集；训练窗口内 5 折**扩展窗** CV，train 尾部 **purge** horizon 根 + **embargo** 24 根，杜绝前瞻标签跨界
-3. **调参**：Optuna TPE，40 trials，每 trial 5 折平均
-4. **Walk-forward**：额外做 4 窗口滚动训练→滚动预测，报告均值±标准差（防单窗口运气）
-5. **朴素基线**：breakout 对比波动率动量基线，direction3 对比多数类基线；模型必须显著超越基线才算有效
+1. **数据**：MT5 拉取 XAUUSD H1，经月度密度过滤剔除伪装成 H1 的日线历史后 ~20,000 根；
+   存 parquet 快照保证可复现
+2. **防泄漏切分**：末 20% 为不打扰的测试集；训练窗口内 5 折**扩展窗** CV，train 尾部
+   **purge** horizon 根 + **embargo** 24 根，杜绝前瞻标签跨界
+3. **调参**：Optuna TPE，60 trials，每 trial 5 折平均
+4. **Walk-forward**：4 窗口滚动训练→滚动预测，报告均值±标准差
+5. **朴素基线**：breakout 对比波动率动量基线，direction3 对比多数类基线
 6. **宏观特征**：DXY / US10Y / VIX / GLD 日线特征，`shift(1)` + `merge_asof(backward)` 防泄漏对齐到 H1
-
-### 当前模型表现（2026-08-30，干净数据重训）
-
-| 模型 | 测试集 | Walk-forward | 基线 | 结论 |
-|---|---|---|---|---|
-| breakout | AUC 0.764 | 0.771 ± 0.016（4窗口） | 0.652（波动率动量） | **有效**，显著超基线 |
-| direction3 | 准确率 0.374 | 宏AUC 0.539 ± 0.038 | 0.385（多数类） | **无效**，未超基线（诚实结论：H1 方向本质难预测） |
-
-### 回测（含成本：点差 25 点 + 滑点 5 点/边）
-
-| 策略 | 年化收益 | 最大回撤 | 夏普 |
-|---|---|---|---|
-| 买入持有 | 27.2% | -28.8% | 1.62 |
-| 均线交叉（基线） | 0.5% | -1.2% | 1.07 |
-| direction3 做多 | 2.7% | -3.2% | 1.85 |
-| direction3 做空 | 1.1% | -0.7% | 2.25 |
-
-> 回测为样本内信号验证（2023-04 ~ 2026-08），牛市里跑不赢买入持有属正常；模型价值在低回撤与做空腿。`uv run gold-backtest --model all` 复现。
 
 ---
 
-## 置信度门控与多尺度过滤（2026-08-30 实验；2026-08-30 宏观修复后复验）
+## 置信度门控与多尺度过滤
 
-> **重要更新（宏观 bug 修复后）**：旧版 `fetch_macro_series` 默认只拉 5 年数据，
-> D1 训练（2011 起）的前 10 年宏观列全是零填充——旧 D1 模型把"宏观全零"当成了
-> 伪 regime 标记。修复后（全历史拉取 + 缓存键隔离）：
-> - D1 模型 top-15 特征里**首次出现 4 个宏观特征**（macro_dxy_z20 / macro_gld_ret20 /
->   macro_dxy_ma20_bias / macro_us10y_ma20_bias），"宏观在日线咬合更好"的立项动机得到证实
-> - D1 测试宏AUC 从 0.590 降到 0.573（旧分含伪标记水分），WF 0.567±0.040 仍全 >基线
-> - H1×D1 交叉过滤的**方向性结论保持**（同向增强、反向衰减），但幅度变化、样本更小：
->   H1>0.20 无过滤 72.2% → D1 同向 75.0%；H1>0.25 无过滤 88.9%（n=36）。
->   旧版 n=20 的 95% 在新模型下 n=8 样本不足——这正是 PREREGISTRATION.md 存在的原因：
->   n=20 的点估计不可信，预注册阈值等待台账积累真样本外验证。
-
-### direction3 的正确用法：置信度门控
-
-H1 direction3 以全量 argmax 的宏 AUC 0.539 永远超不过基线——但那不是它该干的活。
-用 4 窗口 walk-forward 真样本外概率按 |p_看多 − p_看空| 分层（experiments/gating_backtest_fixed.py）：
-
-| 置信度区间 | 多单数 | 多头命中率 | 说明 |
-|---|---|---|---|
-| < 0.20（98% 的时间） | ~4000 | 39% ≈ 基线 | ≈抛硬币，勿用 |
-| > 0.25 | 119 | **72%**（z=7.4, p<1e-13） | 含成本回测 17 笔胜率 76%，回撤 -0.2% |
-
-模型知道什么时候不知道：它的"看多"大多数是敷衍（0.05-0.15 区间），偶尔的强置信是真信号。
-`predict_direction_3class` 的「高置信信号」字段即此门控。空头腿较弱（40%），不建议对称使用。
-
-### D1 方向模型：独立无效，过滤有效
-
-D1 有 2011-11 至今 3,829 根真实日线（已验证与 H1 聚合逐日一致），宏观特征（DXY/US10Y/VIX/GLD）
-本身就是日线级，在 D1 尺度咬合更好。实验结论（experiments/d1_*.py，data/reports/d1_*.json）：
-
-1. **统计信号存在**：WF 5 窗口宏 AUC 全部 >0.5，均值 0.559；置信度分层平均 5 日收益单调（conf>0.25 时 +0.37%/5日，t=2.89, p=0.004）
-2. **独立交易无效**：含成本回测（点差 25 点+滑点 5 点，2×ATR 止损/3×ATR 止盈/最长持仓 5 日）δ=0.15 做多夏普 3.74——但**同频率随机开多对照夏普 3.22-4.28，全部 OOS 日开多 4.30**。门控的可交易边际 ≈0，之前看似不错的夏普是黄金多头漂移 + ATR 出场结构的 beta
-3. **作为 H1 信号的过滤器有效**（experiments/h1_x_d1_filter_test.py，OOS 2025-10~2026-08）：
-
-| H1 置信度 | D1 过滤 | n | 24h 命中率 | 平均收益 |
-|---|---|---|---|---|
-| > 0.25 | 无 | 36 | 88.9% | +1.46% |
-| > 0.20 | 无 | 169 | 72.2% | +0.83% |
-| > 0.20 | D1 看多（conf>0） | 88 | **75.0%** | +0.82% |
-| > 0.15 | 无 | 912 | 60.0% | +0.32% |
-| > 0.15 | D1 看多（conf>0） | 651 | 62.5% | +0.45% |
-| > 0.15 | D1 看多（conf>0.15） | 536 | 60.8% | +0.46% |
-
-（上表为宏观修复后重训模型的复验数字；H1>0.25 × D1 的交叉格 n=8 样本不足，按
-PREREGISTRATION.md 的预注册规则等台账积累。）
-
-用法：`predict_direction_3class` 出现高置信多头时，再调 `predict_direction_d1` 看过滤意见——
-同向才执行，反向放弃。两模型独立训练、独立特征窗口，D1 结论对 H1 是真正的第二意见。
+- **direction3 置信度门控**：|p多−p空|>0.25 的多头腿命中率 72%（基线 39%）；空头腿较弱（40%）
+- **D1 方向模型**：独立交易无效（=多头 beta），但作为 H1 高置信信号的**过滤器**有效
+  - 叠加后命中率 ~75%（vs 不叠加 72%）
 
 ---
 
@@ -182,20 +57,17 @@ PREREGISTRATION.md 的预注册规则等台账积累。）
 | 类别 | 特征 |
 |---|---|
 | 多周期收益 | `ret_1/2/3/6/12/24/48` |
-| K 线几何 | `body_ratio`（实体占比）、`upper_wick/lower_wick`（上下影线占比）、`hl_range` |
-| 技术指标 | `rsi_7/14`、`macd/macd_signal/macd_hist`、`atr_7/14`（归一化）、`bb_pos_20`（布林带位置） |
-| 均线族 | `ma_bias_10/20/50/100/200`、`ema_cross`（EMA20/EMA50 偏离） |
+| K 线几何 | `body_ratio`、`upper_wick/lower_wick`、`hl_range` |
+| 技术指标 | `rsi_7/14`、`macd` 族、`atr_7/14`、`bb_pos_20` |
+| 均线族 | `ma_bias_10/20/50/100/200`、`ema_cross` |
 | 波动/动量 | `vol_12/24/72/168`、`mom_12/24/72/168`、`skew_24/kurt_24` |
-| 成交量 | `vol_ratio_24`、`vol_chg`（仅在 tick_volume 可用时） |
-| 状态指纹 | `autocorr_24`（24 根收益一阶自相关） |
+| 成交量 | `vol_ratio_24`、`vol_chg` |
+| 状态指纹 | `autocorr_24` |
 | 时段特征 | `hour_sin/cos`、`dow_sin/cos` |
 | 支撑阻力 | `dist_to_high/low_10/20/50`、`range_position_10/20/50` |
-| 斐波那契 | `fib_236/382/500/618`（基于近 50 根高低点） |
-| 趋势强度 | `adx_plus/minus/diff`（简化版 ADX） |
-| 动量加速度 | `mom_accel_12/24` |
-| 波动率比率 | `vol_ratio_12_168`、`vol_ratio_24_72` |
-| K 线动量 | `body_mom_3/6`、`wick_ratio` |
-| 宏观驱动 | `macro_dxy/us10y/vix/gld` 各 4 项：`ret5/ret20/z20/ma20_bias`（日线级，防泄漏对齐） |
+| 斐波那契 | `fib_236/382/500/618` |
+| 趋势强度 | `adx_plus/minus/diff` |
+| 宏观驱动 | `macro_dxy/us10y/vix/gld` 各 4 项：`ret5/ret20/z20/ma20_bias` |
 
 ---
 
@@ -205,142 +77,65 @@ PREREGISTRATION.md 的预注册规则等台账积累。）
 E:\Documents\PythonProjects\gold-lgbm-mt5\
 ├── pyproject.toml
 ├── README.md
-├── tests/test_pipeline.py     # 13 项单元测试（标签/防泄漏/过滤/回测/台账）
+├── PREREGISTRATION.md
+├── tests/test_pipeline.py     # 单元测试
 ├── src/gold_model/
-│   ├── config.py             # 周期/阈值/路径配置
-│   ├── mt5_client.py         # MT5 报价 + K 线（线程锁/连接复用/来源标记/密度过滤）
-│   ├── features.py           # 65 维价格特征 + 二分类/三分类标签（自适应阈值）
+│   ├── config.py             # 训练/评估配置
+│   ├── mt5_client.py         # MT5 报价 + K 线（线程锁/连接复用/密度过滤）
+│   ├── features.py           # 65 维价格特征 + 二分类/三分类标签
 │   ├── macro_features.py     # 宏观特征（DXY/US10Y/VIX/GLD，防泄漏对齐）
-│   ├── news.py               # 财经日历/快讯抓取 + 非农/CPI 事件影响分析
-│   ├── yahoo_finance.py      # Yahoo Finance 宏观数据（GLD/UUP/VIX/美债等）
-│   ├── cftc.py               # CFTC 黄金持仓报告（每周五更新）
-│   ├── fred.py               # FRED 美债实际收益率/通胀预期（需 API key）
-│   ├── gld_holdings.py       # SPDR GLD 黄金 ETF 持仓量
-│   ├── fedwatch.py           # CME FedWatch 利率概率
-│   ├── daily_briefing.py     # 每日黄金早报生成器
-│   ├── train.py              # Optuna + LightGBM 训练（purge/embargo + walk-forward + 基线）
-│   ├── backtest.py           # 向量化回测器（点差/滑点/ATR 止损止盈）
-│   ├── accuracy_check.py     # 预测对账（周度命中率/校准）
-│   └── serve_mcp.py          # HTTP MCP 服务（中文输出，模型热更新，预测落盘）
+│   ├── ledger.py             # 预测台账（供 accuracy_check 对账）
+│   ├── train.py              # Optuna + LightGBM 训练
+│   ├── backtest.py           # 向量化回测器（含随机对照）
+│   ├── walkforward.py        # 共享 walk-forward 评估
+│   ├── calibration.py        # 概率校准（isotonic）
+│   ├── accuracy_check.py     # 预测对账（命中率/校准）
+│   └── drift.py              # 特征漂移监控（PSI）
+├── experiments/              # 实验脚本（D1 门控、H1×D1 交叉过滤等）
 ├── data/
-│   ├── xauusd_h1_snapshot.parquet   # 训练数据快照（可复现）
-│   └── prediction_ledger.jsonl      # 预测台账（周度对账用）
-├── models/
-│   ├── gold_lgbm_breakout.pkl     # 波动扩张模型
-│   ├── gold_lgbm_direction3.pkl   # 方向三分类模型
-│   ├── train_report_*.json        # 训练报告（含基线对比/walk-forward）
-│   └── features.json              # 特征列清单
-└── data/reports/backtest_report.json  # 最近一次回测报告
+│   ├── xauusd_h1_snapshot.parquet   # 训练数据快照
+│   ├── xauusd_d1_snapshot.parquet   # 日线训练数据快照
+│   └── prediction_ledger.jsonl      # 预测台账
+└── models/
+    ├── gold_lgbm_breakout.pkl       # 波动扩张模型
+    ├── gold_lgbm_direction3.pkl     # 方向三分类模型
+    ├── gold_lgbm_direction_d1.pkl   # 日线方向模型
+    ├── train_report_*.json          # 训练报告
+    └── features.json                # 特征列清单
 ```
 
 ### 常用命令
 
 ```bash
 uv run gold-train --target breakout --use-snapshot   # 重训（复用数据快照）
-uv run gold-backtest --model all                     # 回测：模型 vs 基线 vs 买入持有（含随机对照）
+uv run gold-backtest --model all                     # 回测：模型 vs 基线 vs 买入持有
 uv run gold-accuracy --days 7                        # 预测对账（命中率/校准）
 uv run gold-drift                                    # 特征漂移检查（PSI）
-uv run --with pytest pytest tests/ -q                # 单元测试（22 项）
-uv run gold-mcp                                       # 启动 MCP 服务
+uv run --with pytest pytest tests/ -q                # 单元测试
 ```
 
 ---
 
-## 运维与统计纪律（2026-08-30 工程化）
+## 运维与统计纪律
 
-### 特征漂移监控（gold-drift / check_drift）
-
-模型悄悄失效不会报警——每次训练自动保存训练特征的分位数参考
-（`models/drift_reference_<target>.json`），`gold-drift` 或 MCP 工具 `check_drift`
-对比近期真实行情的分布（PSI）。判读：PSI<0.10 稳定；0.10~0.25 轻度漂移；>0.25 显著漂移
-（多个特征超阈值 → 建议重训）。建议每周跑一次。
+### 特征漂移监控（gold-drift）
+每次训练自动保存训练特征的分位数参考（`models/drift_reference_<target>.json`），
+`gold-drift` 对比近期真实行情的分布（PSI）。判读：PSI<0.10 稳定；0.10~0.25 轻度漂移；>0.25 显著漂移。
 
 ### 概率校准（isotonic）
-
-LightGBM 多分类输出是未校准的排序分数。现在多分类模型训练时会在 WF 样本外概率上
-拟合 isotonic 校准器（`models/*.calib.pkl`），预测工具输出「校准概率」——
-"历史同置信度情形下的真实方向频率"。1/4 Kelly 仓位建议也基于校准概率计算。
+多分类模型训练时在 WF 样本外概率上拟合 isotonic 校准器，1/4 Kelly 仓位建议基于校准概率计算。
 
 ### 随机对照回测
-
-`gold-backtest` 对每个模型策略自动附带「同频率随机信号对照」（3 个种子）：
-模型夏普必须显著高于随机对照分布，择时才算真有效。这是 D1 实验教训的落地——
-D1 门控回测夏普 3.74 曾看似有效，随机对照 3.22~4.28 揭穿其为多头 beta。
-
-### 隔夜利息（swap）
-
-回测现在计入持仓成本：多头 -3.5% 年化、空头 -1.0%（保守），按跨自然日数计。
-逐笔交易的「其中隔夜利息」字段可查。D1 策略持仓 ~4.5 天，swap 不再可忽略。
-
-### 模型版本管理
-
-重训时旧模型自动归档到 `models/archive/<name>_<时间戳>_cv<分数>.pkl`，
-Optuna study 持久化到 `models/optuna_<target>.db`（重训继续上次搜索）。
+`gold-backtest` 对每个模型策略自动附带同频率随机信号对照（3 个种子）——模型夏普必须显著高于随机对照分布。
 
 ### 预注册验证（PREREGISTRATION.md）
-
-置信度门控（H1>0.25）、H1×D1 交叉过滤的判定规则、有效阈值、失效标准全部预注册冻结。
-探索性结果（多阈值扫描挑出的组合）明确标记为不可作决策依据。台账数据按预注册规则判定，
-防止事后挑阈值的花园分岔路径问题。
-
-### CI
-
-GitHub Actions（`.github/workflows/ci.yml`）：ruff + pytest（22 项），无 MT5 依赖。
-ruff src/tests 全绿；抓取类模块的宽异常捕获（BLE001）按设计豁免并注释说明。
+置信度门控、H1×D1 交叉过滤的判定规则、有效阈值、失效标准全部预注册冻结。
 
 ---
 
 ## 已知限制
 
-- MT5 终端必须已安装并登录。数据不可用时：K 线/报价工具返回合成数据并明确标注（`数据来源: 合成数据`）；**预测工具直接拒绝服务**（防止用假数据出信号）
-- 经纪商 H1 历史深度有限：2023-03 之前的"H1"实际是伪装的日线（已自动过滤），干净样本只有约 3.4 年
-- **direction3 模型未超过多数类基线**（walk-forward 宏AUC 0.539），方向信号仅作参考，不应单独作为开仓依据；breakout 模型（波动扩张）已验证有效
-- 模型预测的是**条件概率**，不构成投资建议；回测含点差/滑点，但不含隔夜利息与滑点极端情况
-- 模型缓存按文件 mtime 自动失效，重训后无需重启服务
-- 金十/FX678 的免费 API 不稳定，建议申请金十开放平台 API key（https://open.jin10.com/）以获得稳定数据
-- 非农/CPI 等数据公布时间基于美国夏令时（3月-11月），冬令时（11月-3月）会推迟 1 小时
-
-## 财经资讯接入
-
-### 配置金十 API（推荐）
-
-1. 访问 https://open.jin10.com/ 注册并申请 API key
-2. 编辑 `src/gold_model/news.py`，设置 `JIN10_API_KEY = "你的key"`
-3. 重启 MCP 服务
-
-### 配置 FRED API（推荐）
-
-1. 访问 https://fred.stlouisfed.org/docs/api/api_key.html 免费申请 API key
-2. 编辑 `src/gold_model/fred.py`，设置 `FRED_API_KEY = "你的key"`
-3. 重启 MCP 服务
-
-### 无 API 时的备用方案
-
-- 系统会自动尝试网页抓取（可能不稳定）
-- 所有事件影响分析基于内置规则，不依赖外部数据
-- 支持手动输入事件进行分析：`analyze_event("美国非农就业报告")`
-
-### 支持的事件类型
-
-| 事件类型 | 重要性 | 对黄金影响 |
-|---------|--------|-----------|
-| 非农 | 极高 | 数据好→美元强→黄金跌；数据差→美元弱→黄金涨 |
-| CPI | 极高 | CPI 高→通胀→加息预期→黄金跌；CPI 低→降息预期→黄金涨 |
-| 美联储 | 极高 | 加息/鹰派→黄金跌；降息/鸽派→黄金涨 |
-| GDP | 高 | GDP 强→风险偏好→黄金跌；GDP 弱→避险→黄金涨 |
-| PCE | 高 | 美联储最关注的通胀指标，影响同 CPI |
-| 失业率 | 高 | 失业率升→经济弱→黄金涨；失业率降→经济强→黄金跌 |
-| 初请失业金 | 中 | 每周数据，反映就业市场短期变化 |
-| ADP | 中 | 小非农，非农的前瞻指标 |
-| 零售销售 | 中 | 反映消费状况 |
-| ISM | 中 | 制造业景气度先行指标 |
-| 黄金储备 | 高 | 央行购金→长期利好黄金 |
-
-### 定时任务示例
-
-```python
-# 每天早上 8 点生成黄金早报
-from gold_model.news import get_daily_briefing
-briefing = get_daily_briefing()
-# 包含：今日事件、未来3天事件、模型预测、K线摘要、市场状态
-```
+- MT5 终端必须已安装并登录。数据不可用时 K 线返回合成数据并明确标注
+- 经纪商 H1 历史深度有限：2023-03 之前的"H1"实际是伪装的日线（已自动过滤）
+- direction3 模型未超过多数类基线，方向信号仅作参考；breakout 模型已验证有效
+- 模型预测的是条件概率，不构成投资建议

@@ -204,7 +204,7 @@ class TestBacktest:
         assert res["统计"]["交易笔数"] == 0
 
     def test_synthetic_refusal(self):
-        """合成数据必须被 serve_mcp 拒绝（is_synthetic 路径）。"""
+        """合成数据标记检查（is_synthetic）。"""
         from gold_model import mt5_client
 
         synth = mt5_client.synthetic_klines(bars=100)
@@ -212,17 +212,17 @@ class TestBacktest:
 
 
 # ---------------------------------------------------------------------------
-# serve_mcp 单元逻辑
+# ledger 单元逻辑
 # ---------------------------------------------------------------------------
 
 class TestLedger:
     def test_record_prediction(self, tmp_path, monkeypatch):
-        from gold_model import serve_mcp
+        from gold_model import ledger
 
-        monkeypatch.setattr(serve_mcp, "PREDICTION_LEDGER", tmp_path / "ledger.jsonl")
-        serve_mcp._record_prediction("breakout", {"信号": "预期扩张", "扩张概率": 0.7, "最新收盘价": 4000.0, "K线时间": "2026-01-01"})
-        serve_mcp._record_prediction("direction3", {"信号": "x", "看空概率": 0.2, "观望概率": 0.3, "看多概率": 0.5, "预测类别": "看多", "最新收盘价": 4000.0, "K线时间": "2026-01-01"})
-        serve_mcp._record_prediction("direction_d1", {"信号": "y", "看空概率": 0.3, "观望概率": 0.5, "看多概率": 0.2, "预测类别": "观望", "最新收盘价": 4000.0, "K线时间": "2026-01-01"})
+        monkeypatch.setattr(ledger, "PREDICTION_LEDGER", tmp_path / "ledger.jsonl")
+        ledger.record_prediction("breakout", {"信号": "预期扩张", "扩张概率": 0.7, "最新收盘价": 4000.0, "K线时间": "2026-01-01"})
+        ledger.record_prediction("direction3", {"信号": "x", "看空概率": 0.2, "观望概率": 0.3, "看多概率": 0.5, "预测类别": "看多", "最新收盘价": 4000.0, "K线时间": "2026-01-01"})
+        ledger.record_prediction("direction_d1", {"信号": "y", "看空概率": 0.3, "观望概率": 0.5, "看多概率": 0.2, "预测类别": "观望", "最新收盘价": 4000.0, "K线时间": "2026-01-01"})
         lines = (tmp_path / "ledger.jsonl").read_text(encoding="utf-8").strip().splitlines()
         assert len(lines) == 3
         import json
